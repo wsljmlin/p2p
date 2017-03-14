@@ -1,0 +1,800 @@
+#include "Tracker.h"
+#include "Setting.h"
+#include "Timer.h"
+#include "Util.h"
+#include "Statistician.h"
+#include "FileStorage.h"
+#include "DownloadManager.h"
+#include "DownloadListManager.h"
+#include "PeerManager.h"
+
+#ifdef SM_DBG
+#define TRACKER_PRT(fmt, arg...) fprintf(stdout, "[%s(%s):%d] "fmt, __FUNCTION__, "Tracker",__LINE__, ##arg)
+#else
+#define TRACKER_PRT(fmt, arg...)
+#endif
+
+
+string GetCurrStrTime()
+{
+	SYSTEMTIME tm;
+	memset(&tm,0,sizeof(SYSTEMTIME));
+	GetLocalTime(&tm);
+	char buf[128];
+	sprintf(buf,"%d.%d.%d %d:%d:%d",tm.wYear,tm.wMonth,tm.wDay,tm.wHour,tm.wMinute,tm.wSecond);
+	return buf;
+}
+
+#define CHECK_LOGIN_RETURN(iRet) if(!m_isLogin) return iRet;
+//****************************
+
+Tracker::Tracker(void)
+: Speaker<TrackerListener>(5)
+, m_peer(NULL)
+, m_isLogin(false)
+, m_loginTimes(0)
+, m_isLastLoginSucceed(true)
+, m_isReportShareAll(false)
+, m_iCurrTick(0)
+, m_iLastReadTick(0)
+, m_iOfflineCount(0)
+, m_iUseTrackAddr_i(0)
+
+{
+}
+
+Tracker::~Tracker(void)
+{
+}
+
+int Tracker::init()
+{
+	if(m_peer)
+		return 0;
+	m_strBeginTime = GetCurrStrTime();
+	LOG_disconnect("Tracker::init()");
+	m_peer = new Peer(IPT_TCP,TCP_CONN,-1);
+	m_peer->add_listener(this);
+	TimerSngl::instance()->register_timer(this,1,1000);
+	AutoLogin();
+	return 0;
+}
+void Tracker::fini()
+{
+	if(!m_peer)
+		return;
+	LogOut();
+	TimerSngl::instance()->unregister_all(this);
+	m_peer->remove_listener(this);
+	delete m_peer;
+	ClearShareFileList();
+}
+
+int Tracker::on_update_nattype()
+{
+	//UDP端口变也使用此接口
+	if(g_netLiveInfo.isNatChecked)
+	{
+		char buf[16];
+		sprintf(buf,"nat=%d",g_netLiveInfo.natType);
+		string logpath = SettingSngl::instance()->get_log_path() + "nat.txt";
+		DEBUGMSG("#:%s \n",buf);
+		{
+			FILE *fp = fopen(logpath.c_str(),"wb+");
+			if(fp)
+			{
+				fwrite(buf,strlen(buf),1,fp);
+				fclose(fp);
+			}
+		}
+		if(-1==g_netLiveInfo.natType || 5==g_netLiveInfo.natType)
+			g_netLiveInfo.natType = 3;
+		PTL_ReportNat();
+		PTL_ReportShareFileAll();
+	}
+	return 0;
+}
+
+#ifdef SM_VOD
+int Tracker::PTL_ReportShareFile(const hash_t& hash, int filetype)
+{
+	TRACKER_PRT(" filetype=%d\n", filetype);
+	/* vod will no report urldl */
+	if((PLAYTYPE_VOD==filetype) && (HT_URLDL==hash.hash_type())) return 0;
+	/* live will not report url2 */
+	if((PLAYTYPE_VOD!=filetype) && (HT_URL2==hash.hash_type())) return 0;
+	CHECK_LOGIN_RETURN(-1)
+	PTL_P2T_ReportShareFile inf;
+	inf.filetype = filetype;
+	if(0 == FileStorageSngl::instance()->get_sharefile(hash,inf.files[0]))
+		inf.num = 1;
+	else
+		return 0;
+	DEBUGMSG("# PTL_ReportShareFile(%d) \n",inf.num);
+	return SendPTLPacket(PTL_P2T_REPORT_SHARE_FILE,inf,1024);
+}
+int Tracker::PTL_ReportShareFile(const hash_t& hash, int filetype, uint64 size)
+{
+	TRACKER_PRT(" filetype=%d\n", filetype);
+	/* vod will no report urldl */
+	if((PLAYTYPE_VOD==filetype) && (HT_URLDL==hash.hash_type())) return 0;
+	/* live will not report url2 */
+	if((PLAYTYPE_VOD!=filetype) && (HT_URL2==hash.hash_type())) return 0;
+	CHECK_LOGIN_RETURN(-1)
+	//int vod, will report all file
+	PTL_P2T_ReportShareFile inf;
+	inf.num = 1;
+	inf.filetype = filetype;
+	memcpy(inf.files[0].fhash,hash.buffer(),HASHLEN);
+	inf.files[0].fsize = size;
+	return SendPTLPacket(PTL_P2T_REPORT_SHARE_FILE,inf,1024);
+}
+
+int Tracker::PTL_ReportRemoveFile(const hash_t& hash, int filetype)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	ClearShareFile(hash);
+	PTL_P2T_ReportShareFile inf;
+	inf.filetype = filetype;
+	memcpy(inf.files[0].fhash,hash.buffer(),HASHLEN);
+	inf.num = 1;
+	TRACKER_PRT("will remove file....!\n");
+	return SendPTLPacket(PTL_P2T_REPORT_REMOVE_FILE,inf,1024);
+}
+
+int Tracker::PTL_ReportStartDownloadFile(const hash_t& hash, int filetype)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportStartDownloadFile inf;
+	inf.filetype = filetype;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	return SendPTLPacket(PTL_P2T_REPORT_START_DOWNLOAD_FILE,inf,1024);
+}
+int Tracker::PTL_ReportStartDownloadList(const hash_t& hash,int filetype, const string& url)
+{
+	CHECK_LOGIN_RETURN(-1)
+	PTL_P2T_ReportStartDownloadList inf;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	assert(url.length()<1024);
+	strcpy(inf.url,url.c_str());
+	inf.filetype = filetype;
+	return SendPTLPacket(PTL_P2T_REPORT_START_DOWNLOAD_LIST,inf,1024);
+}
+
+int Tracker::PTL_ReportStopDownloadFile(const hash_t& hash, int filetype)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportStopDownloadFile inf;
+	inf.filetype = filetype;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	return SendPTLPacket(PTL_P2T_REPORT_STOP_DOWNLOAD_FILE,inf,1024);
+}
+
+int Tracker::PTL_RequestFileSource(const hash_t& hash, int filetype)
+{
+	CHECK_LOGIN_RETURN(-1)
+	PTL_P2T_RequestFileSource inf;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	inf.maxnum = 90;
+	inf.filetype = filetype;
+	return SendPTLPacket(PTL_P2T_REQUEST_FILE_SOURCE,inf,1024);
+}
+
+int Tracker::PTL_ReportDownloadWrong(const hash_t& hash,const hash_t& newHash, int filetype)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportDownloadWrong inf;
+	inf.filetype = filetype;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	memcpy(inf.fhashnew,newHash.buffer(),HASHLEN);
+	return SendPTLPacket(PTL_P2T_REPORT_DOWNLOAD_WRONG,inf,1024);
+}
+
+#endif
+
+int Tracker::PTL_ReportShareFile(const hash_t& hash)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportShareFile inf;
+	if(0 == FileStorageSngl::instance()->get_sharefile(hash,inf.files[0]))
+		inf.num = 1;
+	else
+		return 0;
+	DEBUGMSG("# PTL_ReportShareFile(%d) \n",inf.num);
+	return SendPTLPacket(PTL_P2T_REPORT_SHARE_FILE,inf,1024);
+}
+int Tracker::PTL_ReportShareFile(const hash_t& hash,uint64 size)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportShareFile inf;
+	inf.num = 1;
+	memcpy(inf.files[0].fhash,hash.buffer(),HASHLEN);
+	inf.files[0].fsize = size;
+	return SendPTLPacket(PTL_P2T_REPORT_SHARE_FILE,inf,1024);
+}
+
+int Tracker::PTL_ReportRemoveFile(const hash_t& hash)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	ClearShareFile(hash);
+	PTL_P2T_ReportShareFile inf;
+	memcpy(inf.files[0].fhash,hash.buffer(),HASHLEN);
+	inf.num = 1;
+	return SendPTLPacket(PTL_P2T_REPORT_REMOVE_FILE,inf,1024);
+}
+int Tracker::PTL_ReportStartDownloadFile(const hash_t& hash)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportStartDownloadFile inf;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	return SendPTLPacket(PTL_P2T_REPORT_START_DOWNLOAD_FILE,inf,1024);
+}
+int Tracker::PTL_ReportStartDownloadList(const hash_t& hash,const string& url)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportStartDownloadList inf;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	assert(url.length()<1024);
+	strcpy(inf.url,url.c_str());
+	return SendPTLPacket(PTL_P2T_REPORT_START_DOWNLOAD_LIST,inf,1024);
+}
+int Tracker::PTL_ReportStopDownloadFile(const hash_t& hash)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportStopDownloadFile inf;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	return SendPTLPacket(PTL_P2T_REPORT_STOP_DOWNLOAD_FILE,inf,1024);
+}
+int Tracker::PTL_RequestFileSource(const hash_t& hash)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_RequestFileSource inf;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	inf.maxnum = 90;
+	return SendPTLPacket(PTL_P2T_REQUEST_FILE_SOURCE,inf,1024);
+}
+int Tracker::PTL_ReportDownloadWrong(const hash_t& hash,const hash_t& newHash)
+{
+	CHECK_LOGIN_RETURN(-1)
+	//url2类型不共享
+	if(HT_URL2==hash.hash_type())
+		return -1;
+	PTL_P2T_ReportDownloadWrong inf;
+	memcpy(inf.fhash,hash.buffer(),HASHLEN);
+	memcpy(inf.fhashnew,newHash.buffer(),HASHLEN);
+	return SendPTLPacket(PTL_P2T_REPORT_DOWNLOAD_WRONG,inf,1024);
+}
+int Tracker::PTL_ReportDownloadFileSpeed(PTL_P2T_ReportDownloadFileSpeed& inf)
+{
+	CHECK_LOGIN_RETURN(-1)
+	return SendPTLPacket(PTL_P2T_REPORT_DOWNLOAD_FILE_SPEED,inf,1024);
+}
+int Tracker::PTL_ReportDownloadFileInfo(PTL_P2T_ReportDownloadFileInfo& inf)
+{
+	CHECK_LOGIN_RETURN(-1)
+	return SendPTLPacket(PTL_P2T_REPORT_DOWNLOAD_FILE_INFO,inf,1024);
+}
+int Tracker::PTL_RequestConnTurn(uint32 trackID,uint32 sessionID)
+{
+	CHECK_LOGIN_RETURN(-1)
+	PTL_P2T_RequestConnTurn inf;
+	inf.desTrackID = trackID;
+	inf.desSessionID = sessionID;
+	return SendPTLPacket(PTL_P2T_REQUEST_CONN_TURN,inf,1024);
+}
+
+
+void Tracker::on_timer(int e)
+{
+	switch(e)
+	{
+	case 1:
+		OnSencod();
+		break;
+	case 2:
+		OnShareFileTimer();
+		break;
+	default:
+		assert(0);
+		break;
+	}
+}
+int Tracker::AutoLogin()
+{
+	string ip;
+	unsigned short port;
+	m_iOfflineCount = 0;
+	//如果最后一次登陆不成功，换服务器
+	if(!m_isLastLoginSucceed)
+		m_iUseTrackAddr_i = !m_iUseTrackAddr_i;
+	if(0==m_iUseTrackAddr_i)
+		ip = SettingSngl::instance()->get_tracker_ip().c_str();
+	else
+		ip = SettingSngl::instance()->get_tracker_ip().c_str(); //可以get 备用IP
+	port = SettingSngl::instance()->get_tracker_port();
+	DEBUGMSG("#:login tracker [%s : %d] \n",ip.c_str(),port);
+	if(ip.empty())
+		return -1;
+	ip = Util::ip_explain_ex(ip.c_str());
+	return Login(ip.c_str(),port);
+}
+int Tracker::Login(const char* ip,unsigned short port)
+{
+	TRACKER_PRT("login..........!\n");
+	m_loginTimes++;
+	m_isLastLoginSucceed = false;
+	m_isReportShareAll = false;
+	m_iOfflineCount = 0;
+	m_trackAddr.ip = ip;
+	m_trackAddr.port = port;
+	fire(TrackerListener::Connecting());
+	return this->m_peer->connect(ip,port,0);
+}
+int Tracker::LogOut()
+{
+	if(m_peer->get_channel()->get_state()!=DISCONNECTED)
+	{
+		TRACKER_PRT("logout..........!\n");
+		this->PTL_ReportStat();
+		Sleep(100);
+		this->m_peer->disconnect();
+	}
+	return 0;
+}
+
+int Tracker::OnReadData(const char* buf,int len)
+{
+	PTLStream ss((char*)buf,len,len);
+	PTL_Head head;
+	if(0!=ss>>head)
+	{
+		assert(0);
+		return -1;
+	}
+	TRACKER_PRT("receive from tracker command:%d\n", head.cmd);
+	switch(head.cmd)
+	{
+	case PTL_P2T_RESPONSE_LOGIN:
+		ON_PTL_ResponseLogin(ss);
+		break;
+	case PTL_P2T_RESPONSE_FILE_SOURCE:
+		ON_PTL_ResponseFileSource(ss);
+		break;
+	case PTL_P2T_RESPONSE_CONN_TURN:
+		ON_PTL_ResponseConnTurn(ss);
+		break;
+	case PTL_P2T_RESPONSE_KEEPLIVE:
+		ON_PTL_ResponseKeeplive(ss);
+		break;
+	case PTL_P2T_RESPONSE_SERVER_LIST:
+		{
+			PTL_P2T_ResponseServerList inf;
+			ss >> inf;
+		}
+		break;
+	case PTL_P2T_REQUEST_START_DOWNLOAD_LIST:
+		ON_PTL_RequestStartDownloadList(ss);
+		break;
+	case PTL_P2T_REQUEST_STOP_DOWNLOAD_LIST:
+		ON_PTL_RequestStopDownloadList(ss);
+		break;
+	default:
+		assert(0);
+		break;
+	}
+	assert(0==ss.length());
+	return 0;
+}
+template<typename T>
+int Tracker::SendPTLPacket(uint16 cmd,T& inf,int iMaxSize)
+{
+	NEW_MBLOCK_RETURN_INT(block,iMaxSize,-1)
+	PTLStream ss(block->buf,block->buflen,0);
+	m_head.cmd = cmd;
+	ss << m_head;
+	ss << inf;
+	ss.fitsize32(4);
+	block->datalen = ss.length();
+	return m_peer->send(block);
+}
+
+void Tracker::OnSencod()
+{
+	m_iCurrTick++;
+	if (m_isLogin)
+	{
+		if (m_iLastReadTick+120 < m_iCurrTick)  //6分钟内没有收到数据重连
+		{
+			//DEBUGMSG("#*****Tracker timeout 120 sec disconnect() \n");
+			char logbuf[1024];
+			sprintf(logbuf,"tracker keeplive timeout(120 sec) disconnect;login_times=%d, new_peer_times=%d,online_peers=%d",
+				m_loginTimes,PeerManagerSngl::instance()->get_new_peer_times(),
+				PeerManagerSngl::instance()->get_online_peers());
+			LOG_disconnect(logbuf);
+			m_peer->disconnect();
+			return;
+		}
+		if (m_iCurrTick % 55 == 0)
+		{
+			PTL_RequestKeeplive();
+		}
+		if (m_iCurrTick % 300 == 0)
+		{
+			PTL_ReportStat();
+		}
+	}else
+	{
+		if(DISCONNECTED == m_peer->get_channel()->get_state())
+		{
+			//TRACKER_PRT("tracker disconnected!!\n");;
+			if(++m_iOfflineCount > 10)
+				AutoLogin();
+		}
+	}
+}
+void Tracker::OnShareFileTimer()
+{
+	//每次16个=960B
+	if (!m_isLogin)
+	{
+		ClearShareFileList();
+		TimerSngl::instance()->unregister_timer(this,2);
+		return;
+	}
+
+	PTL_P2T_ReportShareFile req;
+	ShareFileList& ls = m_shareFiles;
+	int n=0;
+	PTL_P2T_FileInfo *inf = NULL;
+	int count = 970/sizeof(PTL_P2T_FileInfo);
+	if(!ls.empty())
+	{
+		n=0;
+		for(int i=0;i<count;++i)
+		{
+			inf = ls.front();
+			ls.pop_front();
+			memcpy(&req.files[i],inf,sizeof(PTL_P2T_FileInfo));
+			++n;
+			delete inf;
+			if(ls.empty())
+				break;
+		}
+		req.num = n;
+#ifdef SM_VOD
+		req.filetype = inf->filetype;
+#endif /* end of SM_VOD */
+		SendPTLPacket(PTL_P2T_REPORT_SHARE_FILE,req,1024);
+		DEBUGMSG("#:RSF %d.\n",n);
+	}
+	if(ls.empty())
+	{
+		TimerSngl::instance()->unregister_timer(this,2);
+		DEBUGMSG("#:RSF end!! \n");
+	}
+}
+void Tracker::ClearShareFileList()
+{
+	list<PTL_P2T_FileInfo*>::iterator it;
+	for(it=m_shareFiles.begin();it!=m_shareFiles.end();++it)
+		delete (*it);
+	m_shareFiles.clear();
+}
+void Tracker::ClearShareFile(const hash_t& hash)
+{
+	list<PTL_P2T_FileInfo*>::iterator it;
+	for(it=m_shareFiles.begin();it!=m_shareFiles.end();)
+	{
+		if(0==hash.compare((const unsigned char*)(*it)->fhash))
+		{
+			delete (*it);
+			m_shareFiles.erase(it++);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
+
+int Tracker::PTL_RequestLogin()
+{
+	PTL_P2T_RequestLogin inf;
+	memset(inf.uid,0,PUIDLEN);
+	strcpy(inf.uid,SettingSngl::instance()->get_user_id().c_str());
+	inf.utype = SettingSngl::instance()->get_user_type();
+	inf.menu = SettingSngl::instance()->get_menu();
+	inf.ver = VERSION_NUM;
+	inf.sysver = Util::get_system_version();
+	Util::get_umac(inf.mac);
+	return SendPTLPacket(PTL_P2T_REQUEST_LOGIN,inf,1024);
+}
+int Tracker::PTL_ReportNat()
+{
+	CHECK_LOGIN_RETURN(-1)
+	//if(!g_netLiveInfo.isNatChecked)
+	//	return -1;
+	PTL_P2T_ReportNat inf;
+	inf.ntype = g_netLiveInfo.natType;
+	inf.tcpLocalIP = g_netLiveInfo.tcpLocalIP;
+	inf.tcpLocalPort = g_netLiveInfo.tcpLocalPort;
+	inf.tcpRealIP = g_netLiveInfo.tcpRealIP;
+	inf.tcpRealPort = g_netLiveInfo.tcpRealPort;
+	inf.udpLocalIP = g_netLiveInfo.udpLocalIP;
+	inf.udpLocalPort = g_netLiveInfo.udpLocalPort;
+	inf.udpRealIP = g_netLiveInfo.udpRealIP;
+	inf.udpRealPort = g_netLiveInfo.udpRealPort;
+	return SendPTLPacket(PTL_P2T_REPORT_NAT,inf,1024);
+}
+int Tracker::PTL_ReportShareFileAll()
+{
+	CHECK_LOGIN_RETURN(-1)
+	if (m_isReportShareAll || !g_netLiveInfo.isNatChecked)
+		return 0;
+	FileStorageSngl::instance()->get_sharefile_all(m_shareFiles);
+	m_isReportShareAll = true;
+	if(m_shareFiles.empty())
+	{
+		DEBUGMSG("#:RSF empty! \n");
+		return 0;
+	}
+
+	//一次共享16个,如果最快一秒钟共享100个的,2分钟即12000个,即1秒钟最多共享6次左右(160毫秒)
+	size_t n = 970/sizeof(PTL_P2T_FileInfo);  //一次共享数
+	int tick = 2000;
+	if(m_shareFiles.size()<=n)
+	{
+		//如果一次可以共享完的,在1分钟随机内共享.这样有助于服务器重启时少受冲击
+		tick = rand() % (SettingSngl::instance()->get_sharefiles_max_timer_sec()*1000);
+		if(tick<1000) tick = 1000;
+	}
+	else
+	{
+		n = m_shareFiles.size()/n + 1;       //一共要共享这么多次
+		tick = (int)((SettingSngl::instance()->get_sharefiles_max_timer_sec()*1000)/n);              //希望200秒左右共享完成
+		if(tick>10000) tick=10000;
+		if(tick<10) tick=10;
+	}
+	TRACKER_PRT(" will share %d files, tick=%d\n", m_shareFiles.size(), tick);
+	TimerSngl::instance()->register_timer(this,2,tick);
+	DEBUGMSG("#:RSF begin... \n");
+	return 0;
+}
+int Tracker::PTL_RequestKeeplive()
+{
+	CHECK_LOGIN_RETURN(-1)
+	NEW_MBLOCK_RETURN_INT(block,1024,-1)
+	PTLStream ss(block->buf,block->buflen,0);
+	m_head.cmd = PTL_P2T_REQUEST_KEEPLIVE;
+	ss << m_head;
+	ss.fitsize32(4);
+	block->datalen = ss.length();
+	return m_peer->send(block);
+}
+int Tracker::PTL_ReportStat()
+{
+	CHECK_LOGIN_RETURN(-1)
+	PTL_P2T_ReportStat inf;
+	memset(&inf,0,sizeof(inf));
+	P2PStat st;
+	StatisticianSngl::instance()->GetLastStat(st);
+	uint64 iDownBtyes=0,iShareBtyes=0;
+	
+	for(int i=0;i<3;++i)
+	{
+		iDownBtyes += st.downBytesPerIPT_B[i];
+		iShareBtyes += st.shareBytesPerIPT_B[i];
+	}
+	if(0==iDownBtyes && 0==iShareBtyes)
+		return -1;
+	//
+	for(int i=0;i<5;++i)
+	{
+		inf.connSucceedPerNetT[i] = st.connSucceedPerNetT[i];
+		inf.connFailedPerNetT[i] = st.connFailedPerNetT[i];
+	}
+	for(int i=0;i<3;++i)
+	{
+		inf.downBytesPerIPT_KB[i] = (int)((st.downBytesPerIPT_B[i]+512)>>10);
+		inf.shareBytesPerIPT_KB[i] = (int)((st.shareBytesPerIPT_B[i]+512)>>10);
+	}
+	for(int i=0;i<6;++i)
+	{
+		inf.downBytesPerUserT_KB[i] = (int)((st.downBytesPerUserT_B[i]+512)>>10);
+	}
+	inf.downSeconds = st.downSeconds;
+	inf.shareSeconds = st.shareSeconds;
+	return SendPTLPacket(PTL_P2T_REPORT_STAT,inf,1024);
+}
+int Tracker::PTL_ReportError()
+{
+	assert(0);
+	CHECK_LOGIN_RETURN(-1)
+	return 0;
+}
+int Tracker::PTL_ReportDownloadListMaxnum()
+{
+	PTL_P2T_ReportDownloadListMaxnum inf;
+	inf.downloadlist_maxnum = SettingSngl::instance()->get_downloadlist_maxnum();
+	return SendPTLPacket(PTL_P2T_REPORT_DOWNLOADLIST_MAXNUM,inf,1024);
+}
+int Tracker::ON_PTL_ResponseLogin(PTLStream& ss)
+{
+	PTL_P2T_ResponseLogin rsp;
+	if(0!=ss>>rsp)
+	{
+		assert(0);
+		return -1;
+	}
+	DEBUGMSG("#:login succeed! eyeIP=%s,sessionID=%d \n",Util::ip_htoa(rsp.eyeIP),rsp.sessionID);
+	TRACKER_PRT("my UserID:%s\n", rsp.uid);
+	m_isLogin = true;
+	m_isLastLoginSucceed = true;
+	m_strLastLoginTime = GetCurrStrTime();
+	SettingSngl::instance()->update_user_id(rsp.uid);
+	g_netLiveInfo.sessionID = rsp.sessionID;
+	g_netLiveInfo.trackerID = rsp.trackID;
+	g_netLiveInfo.trackerVer = rsp.trackVer;
+	if(Util::is_private_ip(Util::ip_htoas(rsp.eyeIP)))
+		rsp.eyeIP = 0; //支持tracker在内网时同内网可以互联
+	//如果本地有填写外网IP，直接使用外网IP
+	if(0!=SettingSngl::instance()->get_user_ip())
+		rsp.eyeIP = SettingSngl::instance()->get_user_ip();
+
+	if(0==g_netLiveInfo.tcpRealIP)
+		g_netLiveInfo.tcpRealIP = rsp.eyeIP;
+	if(0==g_netLiveInfo.udpRealIP)
+		g_netLiveInfo.udpRealIP = rsp.eyeIP;
+	if(0==g_netLiveInfo.tcpRealPort)
+		g_netLiveInfo.tcpRealPort = g_netLiveInfo.tcpLocalPort;
+	fire(TrackerListener::Connected());
+	PTL_ReportNat(); //不管检未检测到，先上报端口信息
+	if(g_netLiveInfo.isNatChecked)
+	{
+		PTL_ReportShareFileAll();
+	}
+	if(SettingSngl::instance()->get_user_type()!=UT_CLIENT)
+		PTL_ReportDownloadListMaxnum();
+	return 0;
+}
+int Tracker::ON_PTL_ResponseFileSource(PTLStream& ss)
+{
+	return DownloadManagerSngl::instance()->on_ptl_packet(NULL,PTL_P2T_RESPONSE_FILE_SOURCE,ss);
+}
+int Tracker::ON_PTL_ResponseConnTurn(PTLStream& ss)
+{
+	PTL_P2T_ResponseConnTurn rsp;
+	if(0!=(ss>>rsp))
+	{
+		assert(0);
+		return -1;
+	}
+	if(rsp.desPeerInfo.tcpRealIP == g_netLiveInfo.tcpRealIP) 
+	{
+		//local_tcp
+		Peer *peer = PeerManagerSngl::instance()->get_peer(IPT_TCP,LOCAL_TCP,NULL,true); //是对方的turn
+		if(peer)
+		{
+			DEBUGMSG("#:local_tcp turn(%s:%d) \n",Util::ip_htoa(rsp.desPeerInfo.tcpLocalIP),rsp.desPeerInfo.tcpLocalPort);
+			peer->connect(rsp.desPeerInfo.tcpLocalIP,rsp.desPeerInfo.tcpLocalPort,0);
+		}
+	}else if (0 == rsp.desPeerInfo.ntype)
+	{
+		//real_tcp
+		Peer *peer = PeerManagerSngl::instance()->get_peer(IPT_TCP,TCP_CONN,NULL,true);
+		if (peer)
+		{
+			DEBUGMSG("#:real_tcp turn(%s:%d) \n",Util::ip_htoa(rsp.desPeerInfo.tcpRealIP),rsp.desPeerInfo.tcpRealPort);
+			peer->connect(rsp.desPeerInfo.tcpRealIP,rsp.desPeerInfo.tcpRealPort,0);
+		}			
+	}
+	else
+	{
+		//
+		assert(0);
+	}
+
+	return 0;
+}
+
+int Tracker::ON_PTL_ResponseKeeplive(PTLStream& ss)
+{
+	//目前空包，不用理
+	return 0;
+}
+
+int Tracker::ON_PTL_RequestStartDownloadList(PTLStream& ss)
+{
+	string url;
+	PTL_P2T_RequestStartDownloadList inf;
+	if(0!=(ss>>inf))
+	{
+		assert(0);
+		return -1;
+	}
+	url = inf.url;
+	if(!url.empty())
+		DownloadListManagerSngl::instance()->open_downloadlist(url,"",false,false,true);
+	return 0;
+}
+int Tracker::ON_PTL_RequestStopDownloadList(PTLStream& ss)
+{
+	hash_t hash;
+	PTL_P2T_RequestStopDownloadList inf;
+	if(0!=(ss>>inf))
+	{
+		assert(0);
+		return -1;
+	}
+	hash.set_buffer((unsigned char*)inf.fhash);
+	DownloadListManagerSngl::instance()->close_downloadlist(hash,true);
+	return 0;
+}
+void Tracker::on(PeerListener::Connecting,Peer* peer) 
+{
+}
+void Tracker::on(PeerListener::Connected,Peer* peer)
+{
+	DEBUGMSG("#:Tracker Connected!\n");
+	//考虑更新local ip
+	unsigned int ip = peer->get_channel()->get_my_ip();
+	if(ip && Util::is_private_ip(Util::ip_htoas(ip)))
+	{
+		g_netLiveInfo.tcpLocalIP = ip;
+		g_netLiveInfo.udpLocalIP = ip;
+	}
+	PTL_RequestLogin();
+}
+void Tracker::on(PeerListener::Disconnected,Peer* peer)
+{
+	DEBUGMSG("#:Tracker Disconnected!\n");
+	char logbuf[1024];
+	sprintf(logbuf,"#:--Tracker Disconnected! action-%d ; errno-%d",peer->get_channel()->m_last_action,peer->get_channel()->m_last_error);
+	LOG_disconnect(logbuf);
+	fire(TrackerListener::Disconnected());
+	m_isLogin = false;
+	m_isReportShareAll = false;
+}
+
+void Tracker::on(PeerListener::Data,Peer* peer,char* buf,int len)
+{
+	m_iLastReadTick = m_iCurrTick;
+	this->OnReadData(buf,len);
+}
+void Tracker::on(PeerListener::Writable,Peer* peer)
+{
+}
+

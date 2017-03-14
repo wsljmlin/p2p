@@ -1,0 +1,47 @@
+#pragma once
+#include "TrackerMessage.h"
+#include "User.h"
+
+
+class StatManager
+{
+public:
+	StatManager(void);
+	~StatManager(void);
+
+	void on_login_in(int userType);
+	void on_login_out(int userType);
+	void on_req_file(const char* hashbuf,UserInfo* user);
+	void on_nonfile_seach(const hash_t& hash);
+	void on_nonsource_seach(const hash_t& hash);
+	void on_noncssource_seach(const hash_t& hash);
+	void on_client_error(const PTL_P2T_ReportError& req);
+	void on_download_wrong(const PTL_P2T_ReportDownloadWrong& req,UserInfo &pi);
+	void on_req_stat(const PTL_P2T_ReportStat& st);
+	void handle_timeout();
+
+	time_t get_begin_time() const {return m_begin_time;}
+	int get_msg_tracker_info(MsgTrackerInfo& msg);
+private:
+	void reset();
+	void on_timer_log();
+	void on_timer_dblog();
+private:
+	string m_str_curr_day;
+	time_t m_begin_time;
+	string m_str_begin_time;
+
+	int m_server_num,m_center_num,m_client_num,m_super_num;
+	int m_nat_type_num[7];
+
+	int m_seach_nonfile,m_seach_nonsource; //搜索不到源的情况
+	int m_client_dump_num;        //客户端异常倒掉次数
+	int m_download_wrong_num;
+
+	unsigned int m_req_file_num;  //请求文件次
+	uint32 connect_succceed_count[5]; //下标:0，直接TCP连接；1，callback TCP；2，UDP直接连接；3，UDP callback；4，UDP nat hole 连接
+	uint32 connect_failed_count[5];  
+	uint32 download_bytes_through_channel[3];   //下标:0 TCP 1 UDP,2:HTTP
+	uint32 download_bytes_from_peer[5];          //0:CLT_SERVER,1:CLT_CLIENT,2:CLT_CENTER,3:CLT_NETBAR
+};
+typedef Singleton<StatManager> StatManagerSngl;

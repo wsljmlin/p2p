@@ -1,0 +1,65 @@
+#makefile:
+
+#################################
+CC := mips-linux-gnu-gcc
+CPP := mips-linux-gnu-g++
+AR := mips-linux-gnu-ar
+CFLAGS  = -O2 -DLINUX32 -Wall -Werror -DNDEBUG -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE=1 -D_LARGEFILE64_SOURCE=1 \
+		 -DWITH_XLOADED_UCODE=1 -DSOFT_POWER -EL -DSMP8652 -DHAVE_STDINT_H -pipe -fPIC
+CFLAGS  += -D__MY_BEGIN_DECLS__= -D__MY_END_DECLS__=
+LDFLAGS += -EL
+
+LIBS    = -lpthread
+INCS    = 
+
+##test: sources := $(shell echo *.cpp)  or sources := $(shell ls *.cpp)
+outpath := 
+output := $(outpath)libutil_sg53.a
+sources :=  $(wildcard *.cpp *.c)
+#android系统没有sysinfo,需要使用sysinfo.S支持，即在objects 中增加 sysinfo.o即可
+objects := $(subst .c,.o,$(subst .cpp,.o,$(sources)))
+depends := $(subst .c,.d,$(subst .cpp,.d,$(sources)))
+archives :=
+
+################################
+all: $(output)
+
+%.o:%.c
+	$(CC) $(CFLAGS) $(INCS) -o $@ -c $<
+	
+%.o:%.cpp
+	$(CPP) $(CFLAGS) $(CPPFLAGS) $(INCS) -o $@ -c $<
+	
+
+$(output): $(objects) $(archives)
+	-mkdir $(outpath)
+	$(AR) rv $@ $^
+	
+#################################
+#depend:
+-include $(depends)
+%.d: %.c
+	$(CC) -MM $(CFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+%.d: %.cpp
+	$(CC) -MM $(CPPFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+#################################
+.PHONY : print clean
+print:
+	echo $(sources)
+	echo $(objects)
+	echo $(depends)
+	echo $(CFLAGS)
+	echo $(CPPFLAGS)
+	
+clean:
+	-rm *.d
+	-rm *.o
+	-rm $(output)
+##################################
+

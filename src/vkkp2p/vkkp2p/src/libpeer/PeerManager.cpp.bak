@@ -1,0 +1,211 @@
+#include "PeerManager.h"
+#include "Setting.h"
+
+#ifdef SM_DBG
+#define PEERMANGER_PRT(fmt, arg...) fprintf(stdout, "[%s(%s):%d] "fmt, __FUNCTION__, "PeerManager",__LINE__, ##arg)
+#else
+#define  PEERMANGER_PRT(fmt, arg...)
+#endif
+
+
+PeerManager::PeerManager(void)
+{
+}
+
+PeerManager::~PeerManager(void)
+{
+}
+int PeerManager::init(PeerDownloadHandler* pdh,PeerShareHandler* psh)
+{
+	m_pdh = pdh;
+	m_psh = psh;
+	return PeerFactory::init();
+}
+int PeerManager::add_dref(void* dref,Peer* peer)
+{
+	//考虑支持download之前传递peer
+	int i = peer->get_index();
+	//assert(NULL==m_peers[i].dref);
+	//if(NULL!=m_peers[i].dref)
+	//	return -1;
+	m_peers[i].dref = dref;
+	return 0;
+}
+int PeerManager::del_dref(void* dref,Peer* peer)
+{
+	int i = peer->get_index();
+	assert(dref && dref==m_peers[i].dref);
+	if(m_peers[i].dref != dref)
+		return -1;
+	m_peers[i].dref = NULL;
+	if(!m_peers[i].bshare)
+		put_peer(peer);
+	else
+		PTL_release(peer);
+	return 0;
+}
+int PeerManager::add_share(Peer* peer)
+{
+	assert(!m_peers[peer->get_index()].bshare);
+	m_peers[peer->get_index()].bshare = true;
+	return 0;
+}
+int PeerManager::del_share(Peer* peer)
+{
+	assert(m_peers[peer->get_index()].bshare);
+	m_peers[peer->get_index()].bshare = false;
+	return 0;
+}
+int PeerManager::check_put_peer(Peer* peer)
+{
+	if(!m_peers[peer->get_index()].bshare && NULL==m_peers[peer->get_index()].dref)
+		put_peer(peer);
+	return 0;
+}
+void PeerManager::on(PeerListener::Connecting,Peer* peer)
+{
+}
+void PeerManager::on(PeerListener::Connected,Peer* peer)
+{
+	PTL_welcome(peer);
+}
+void PeerManager::on(PeerListener::Data,Peer* peer,char* buf,int len)
+{
+	m_peers[peer->get_index()].peer->m_last_active_tick = m_curr_tick;
+	_ss.attach(buf,len,len);
+	PTL_Head& head = _head;
+	if(0!=(_ss >> head))
+	{
+		assert(0);
+		return;
+	}
+
+	//DEBUGMSG("# on cmd = %d \n",head.cmd);
+	switch( head.cmd)
+	{
+	case PTL_P2P_REQUEST_FILE_BLOCK_TABLE:
+	case PTL_P2P_REQUEST_FILE_BLOCKS:
+	case PTL_P2P_CANCEL_FILE_BLOCKS:
+	case PTL_P2P_REQUEST_FILE_SUB_KEYS:
+		{
+			if(!m_peers[peer->get_index()].bshare)
+			{
+				if(0!=m_psh->peer_attach(peer))
+				{
+					return;
+				}
+			}
+			m_psh->on_ptl_packet(peer,head.cmd,_ss);
+			PEERMANGER_PRT("request block tabe,or blocks, or blocktable !\n");
+		}
+		break;
+	case PTL_P2P_RESPONSE_FILE_BLOCK_TABLE:
+	case PTL_P2P_RESPONSE_FILE_BLOCKS:
+	case PTL_P2P_RESPONSE_FILE_BLOCKS_DATA:
+	case PTL_P2P_RESPONSE_FILE_SUB_KEYS:
+		{
+			m_pdh->on_ptl_packet(peer,head.cmd,_ss);
+			PEERMANGER_PRT("recevie block tabe,or blocks, or blocktable !\n");
+		}
+		break;
+	case PTL_P2P_WELCOME:
+		{
+			ON_PTL_welcome(peer,_ss);
+			PEERMANGER_PRT("recevie welcome information !\n");
+		}
+		break;
+	case PTL_P2P_RELEASE:
+		{
+			ON_PTL_release(peer,_ss);
+		}
+		break;
+	default:
+		{
+			assert(0);
+		}
+		break;
+	}
+	assert(0==_ss.length());
+}
+void PeerManager::on(PeerListener::Writable,Peer* peer)
+{
+	m_peers[peer->get_index()].peer->m_last_active_tick = m_curr_tick;
+	if(m_peers[peer->get_index()].bshare)
+		m_psh->on_writable(peer);
+}
+void PeerManager::on_disconnected(Peer* peer)
+{
+	int i = peer->get_index();
+	if(m_peers[i].bshare)
+		m_psh->peer_detach(peer);
+	if(m_peers[i].dref)
+		m_pdh->on_peer_close(peer,m_peers[i].dref);
+	assert(!m_peers[i].bshare && NULL==m_peers[i].dref);
+}
+
+
+int PeerManager::PTL_welcome(Peer* peer)
+{
+	PTL_P2P_Welcome inf;
+	_head.cmd = PTL_P2P_WELCOME;
+	inf.ntype = g_netLiveInfo.natType;
+	inf.sessionID = g_netLiveInfo.sessionID;
+	inf.turn = m_peers[peer->get_index()].bturn;
+	inf.ver = VERSION_NUM;
+	inf.utype = SettingSngl::instance()->get_user_type();
+
+	NEW_MBLOCK_RETURN_INT(block,1024,-1)
+	PTLStream ss(block->buf,block->buflen,0);
+	ss << _head;
+	ss << inf;
+	ss.fitsize32(4);
+	block->datalen = ss.length();
+	peer->send(block);
+	return 0;
+}
+int PeerManager::PTL_release(Peer* peer)
+{
+	_head.cmd = PTL_P2P_RELEASE;
+	NEW_MBLOCK_RETURN_INT(block,1024,-1)
+	PTLStream ss(block->buf,block->buflen,0);
+	ss << _head;
+	ss.fitsize32(4);
+	block->datalen = ss.length();
+	peer->send(block);
+	return 0;
+}
+
+int PeerManager::ON_PTL_welcome(Peer* peer,PTLStream& ss)
+{
+	PTL_P2P_Welcome inf;
+	if(!peer || 0!=(ss >> inf))
+	{
+		assert(0);
+		return -1;
+	}
+	//注意:sessionID在使用本地cache源的时候会不相等，所以这里要判断未设置sessionID的话才设置，否则使用创建连接时设置的
+	if((uint32)-1 == peer->get_sessionID())
+		peer->set_sessionID(inf.sessionID);
+	peer->set_nat_type(inf.ntype);
+	peer->set_user_type(inf.utype);
+	if(inf.turn)
+	{
+		//交给下载处理
+		assert(m_peers[peer->get_index()].dref == NULL);
+		m_pdh->on_peer_turn(peer,inf.sessionID);
+	}
+	if(NULL!=m_peers[peer->get_index()].dref)
+		m_pdh->on_peer_ready(peer,m_peers[peer->get_index()].dref);
+	else
+		PTL_release(peer);
+	return 0;
+}
+int PeerManager::ON_PTL_release(Peer* peer,PTLStream& ss)
+{
+	int i = peer->get_index();
+	if (m_peers[i].bshare)
+		m_psh->peer_detach(peer);
+	if (NULL==m_peers[i].dref)
+		put_peer(peer);
+	return 0;
+}

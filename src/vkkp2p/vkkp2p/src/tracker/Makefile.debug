@@ -1,0 +1,93 @@
+#makefile:
+
+#################################
+CC := gcc
+CPP := g++
+AR := ar
+CFLAGS	= -Wall -g -DLINUX32 -D_FILE_OFFSET_BITS=64 -Werror
+
+
+
+
+LIBS    = -lpthread
+INCS    = -I../util -I../protocol -I../comm -I../license -I../httpsvr
+
+##test: sources := $(shell echo *.cpp)  or sources := $(shell ls *.cpp)
+outputdir := ../../bin/tracker/
+output := $(outputdir)tracker_db.e
+sources :=  $(wildcard *.cpp *.c)
+objects := $(subst .c,.o,$(subst .cpp,.o,$(sources)))
+depends := $(subst .c,.d,$(subst .cpp,.d,$(sources)))
+archives := ../comm/libcomm_db.a ../protocol/libprotocol_db.a ../util/libutil_db.a ../license/liblicense_db.a ../httpsvr/libhttpsvr_db.a
+
+################################
+all: $(output)
+
+%.o:%.c
+	$(CC) $(CFLAGS) $(INCS) -o $@ -c $<
+	
+%.o:%.cpp
+	$(CPP) $(CFLAGS) $(CPPFLAGS) $(INCS) -o $@ -c $<
+
+$(output): $(objects) $(archives)
+	-mkdir $(outputdir)
+	$(CPP) $(CFLAGS) $(CPPFLAGS) -o $@ $^ $(LIBS)
+
+../util/libutil_db.a:
+	(cd ../util;make -f Makefile.debug)
+	pwd	
+	
+../protocol/libprotocol_db.a:
+	(cd ../protocol;make -f Makefile.debug)
+	pwd
+			
+../comm/libcomm_db.a:
+	(cd ../comm/;make -f Makefile.debug)
+	pwd	
+
+../license/liblicense_db.a:
+	(cd ../license/;make -f Makefile.debug)
+	pwd	
+
+../httpsvr/libhttpsvr_db.a:
+	(cd ../httpsvr/;make -f Makefile.debug)
+	pwd	
+
+#################################
+#depend:
+-include $(depends)
+%.d: %.c
+	$(CC) -MM $(CFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+%.d: %.cpp
+	$(CC) -MM $(CPPFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+#################################
+.PHONY : print clean
+print:
+	echo $(sources)
+	echo $(objects)
+	echo $(depends)
+	echo $(CFLAGS)
+	echo $(CPPFLAGS)
+	(cd ../util; make print)
+	(cd ../protocol; make print)
+	(cd ../comm; make print)
+	(cd ../license; make print)
+	(cd ../httpsvr; make print)
+	
+clean:
+	-rm *.d
+	-rm *.o
+	-rm $(output)
+	(cd ../util; make clean  -f Makefile.debug)
+	(cd ../protocol; make clean -f Makefile.debug)
+	(cd ../comm; make clean -f Makefile.debug)
+	(cd ../license; make clean -f Makefile.debug)
+	(cd ../httpsvr; make clean -f Makefile.debug)
+##################################
+

@@ -1,0 +1,435 @@
+#include "LogManager.h"
+#include "Util.h"
+
+
+#define _FCLOSE(fd) if(fd) { fclose(fd);fd=NULL;}
+#define _FOPEN(fd,path) fd = fopen(path,"ab+")
+#define _FPUTS_FLUSH(buf,fd) fputs(buf,fd);fflush(fd)
+
+#ifdef SM_MODIFY	
+#define _FOPEN_RETURN(fd,path) {fd = fopen(path,"ab+"); \
+	if(!fd){\
+	char errpath[64];memset(errpath, 0, sizeof(errpath));\
+	sprintf(errpath,"./tracker_log/%s.err.log",format_curr_day().c_str());\
+	char errbuf[128];memset(errbuf, 0, sizeof(errbuf));\
+	sprintf(errbuf,"%s:***open file %s failed",format_curr_time().c_str(), path);\
+	Util::write_log(errbuf,errpath);}};
+#endif
+
+LogManager::LogManager(void)
+:m_binit(false)
+,fd_login(NULL)
+,fd_loginout(NULL)
+,fd_start_file(NULL)
+,fd_start_playlist(NULL)
+,fd_speed_file(NULL)
+,fd_speed_playlist(NULL)
+,fd_downinfo(NULL)
+,fd_realtimeinfo(NULL)
+{
+	m_curr_date = "";
+}
+
+LogManager::~LogManager(void)
+{
+}
+
+//***************************************************************************
+string LogManager::format_curr_day()
+{
+	time_t tt = time(0);
+	tm* t = localtime(&tt);
+	char buf[64];
+	sprintf(buf,"%04d.%02d.%02d",t->tm_year+1900,t->tm_mon+1,t->tm_mday);
+	return buf;
+}
+string LogManager::format_curr_time()
+{
+	time_t tt = time(0);
+	tm* t = localtime(&tt);
+	char buf[32];
+	sprintf(buf,"%02d:%02d:%02d",t->tm_hour,t->tm_min,t->tm_sec);
+	return buf;
+}
+//***************************************************************************
+int LogManager::init()
+{
+	if(m_binit)
+		return 0;
+	m_binit = true;
+	Util::my_create_directory("./tracker_log");
+	update_fd();
+	return 0;
+}
+
+void LogManager::fini()
+{
+	if(!m_binit)
+		return;
+	m_binit = false;
+
+	_FCLOSE(fd_login)
+	_FCLOSE(fd_loginout)
+	_FCLOSE(fd_start_file)
+	_FCLOSE(fd_start_playlist)
+	_FCLOSE(fd_speed_file)
+	_FCLOSE(fd_speed_playlist)
+	_FCLOSE(fd_downinfo)
+	_FCLOSE(fd_realtimeinfo)
+	m_curr_date = "";
+}
+
+#define _CURR_TIME_STR format_curr_time().c_str()
+void LogManager::update_fd()
+{
+	string curr_date = format_curr_day();
+	char buf[128];
+	if(m_curr_date != curr_date)
+	{
+		_FCLOSE(fd_login)
+		_FCLOSE(fd_loginout)
+		_FCLOSE(fd_start_file)
+		_FCLOSE(fd_start_playlist)
+		_FCLOSE(fd_speed_file)
+		_FCLOSE(fd_speed_playlist)
+		_FCLOSE(fd_downinfo)
+		_FCLOSE(fd_realtimeinfo)
+
+		m_curr_date = curr_date;
+		
+		sprintf(buf,"./tracker_log/login_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_login,buf);
+		sprintf(buf,"./tracker_log/loginout_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_loginout,buf);
+		sprintf(buf,"./tracker_log/start_file_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_start_file,buf);
+		sprintf(buf,"./tracker_log/start_playlist_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_start_playlist,buf);
+		sprintf(buf,"./tracker_log/speed_file_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_speed_file,buf);
+		sprintf(buf,"./tracker_log/speed_playlist_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_speed_playlist,buf);
+		sprintf(buf,"./tracker_log/downinfo_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_downinfo,buf);
+		sprintf(buf,"./tracker_log/realtimeinfo_%s.log",m_curr_date.c_str());
+		_FOPEN(fd_realtimeinfo,buf);
+
+		if(fd_login)
+		{	
+			sprintf(_tmpbuf,"\r\n<br>[%s]:      uid,  user_type,  prog_ver,  os_ver,    ip \r\n",_CURR_TIME_STR);
+			_FPUTS_FLUSH(_tmpbuf,fd_login);
+		}
+		if(fd_loginout)
+		{	
+			sprintf(_tmpbuf,"\r\n<br>[%s]:      uid,   file_num,  download_flow,  upload_flow \r\n",_CURR_TIME_STR);
+			_FPUTS_FLUSH(_tmpbuf,fd_loginout);
+		}
+		sprintf(_tmpbuf,"\r\n<br>[%s]:uid,user_type,ip,str_hash,hash_type \r\n",_CURR_TIME_STR);
+		if(fd_start_file)
+		{
+			_FPUTS_FLUSH(_tmpbuf,fd_start_file);
+		}
+		if(fd_start_playlist)
+		{
+			_FPUTS_FLUSH(_tmpbuf,fd_start_playlist);
+		}
+#ifdef SM_MODIFY
+		sprintf(_tmpbuf,"\r\n<br>[%s]:flag,      uid,     nattype,	 ip,      str_hash, "
+				"   hash_type(filesize, speed_KB, downseconds, cacheTimes, dragTimes, cacheSeconds), "
+				"   c-s/f(TCP_TURN,TCP_TURN,UDP_CONN,UDP_TURN,UDP_THRU),"
+				"   s-KB(tcp, udp),"
+				"   d-IPT-KB(tcp, udp,http),"
+				"   d-UT-KB(client,server,http,center,super) \r\n",_CURR_TIME_STR);
+#else
+		sprintf(_tmpbuf,"\r\n<br>[%s]:flag,      uid,      ip,      str_hash, "
+				"   hash_type(filesize, speed_KB, downseconds, cacheTimes, dragTimes, cacheSeconds), "
+				"   c-s/f(TCP_TURN,TCP_TURN,UDP_CONN,UDP_TURN,UDP_THRU),"
+				"   s-KB(tcp, udp),"
+				"   d-IPT-KB(tcp, udp,http),"
+				"   d-UT-KB(client,server,http,center,super) \r\n",_CURR_TIME_STR);
+#endif /* end of SM_MODIFY */
+		if(fd_speed_file)
+		{
+			_FPUTS_FLUSH(_tmpbuf,fd_speed_file);
+		}
+		if(fd_speed_playlist)
+		{
+			_FPUTS_FLUSH(_tmpbuf,fd_speed_playlist);
+		}
+
+		if(fd_downinfo)
+		{
+			sprintf(_tmpbuf,"\r\n<br>[%s]: 1-request_files, 2-tcp_download_flow, 3-udp_download_flow, 4-http_download_flow,"
+				" 5-edge_download_flow, 6-client_download_flow, 7-center_download_flow, 8-super_download_flow,"
+				" 9-tcp_connect_success, 10-tcp_connect_fail, 11-tcp_accept_success, 12-tcp_accept_fail, 13-udp_connect_success, 14-udp_connect_fail,"
+				" 15-udp_receive_success, 16-udp_receive_fail, 17-udp_nat_success, 18-udp_nat_fail\r\n",_CURR_TIME_STR);
+			_FPUTS_FLUSH(_tmpbuf,fd_downinfo);
+		}
+
+		if(fd_realtimeinfo)
+		{
+			sprintf(_tmpbuf,"\r\n<br>[%s]:  online_users,  edge_servers,  center_servers,  super_servers,"
+				"  online_progs,  online_sources,"
+				"  nat_0,  nat_1,  nat_2,  nat_3,  nat_4,  nat_5 \r\n",_CURR_TIME_STR);
+			_FPUTS_FLUSH(_tmpbuf,fd_realtimeinfo);
+		}
+	}
+}
+
+#ifdef SM_MODIFY	
+void LogManager::update_fd(FILE* &fd, string &time, const char* cprename, const char *cbuf )
+{
+	string curr_date = format_curr_day();
+	char buf[128];
+	memset(buf, 0, sizeof(buf));
+	if(time != curr_date)
+	{
+		_FCLOSE(fd)
+
+		time = curr_date;
+
+		/* create file */
+		sprintf(buf,"%s_%s.log",cprename, curr_date.c_str());
+		//_FOPEN(fd, buf);
+		_FOPEN_RETURN(fd, buf)
+
+		/* flush file */
+		if(fd)
+		{
+			_FPUTS_FLUSH(cbuf, fd);
+		}
+	}
+
+}
+
+void LogManager::update_userloginfd()
+{
+	char buf[1024];
+	memset(buf, 0, sizeof(buf));
+	static string timetmp = m_curr_date;
+	
+	sprintf(buf, "\r\n<br>[%s]:      uid,  user_type,  prog_ver,  os_ver,    ip \r\n",_CURR_TIME_STR);
+	update_fd(fd_login, timetmp, "./tracker_log/login",  buf);
+}
+
+void LogManager::update_userloginoutfd()
+{
+	char buf[1024];
+	memset(buf, 0, sizeof(buf));
+	static string timetmp = m_curr_date;
+	
+	sprintf(buf,"\r\n<br>[%s]:      uid,   file_num,  download_flow,  upload_flow \r\n",_CURR_TIME_STR);
+	update_fd(fd_loginout, timetmp, "./tracker_log/loginout", buf);
+
+}
+
+void LogManager::update_startfilefd()
+{
+	char buf[1024];
+	memset(buf, 0, sizeof(buf));
+	static string timetmp = m_curr_date;
+	static string timetmp1 = m_curr_date;
+	
+	sprintf(buf,"\r\n<br>[%s]:uid,user_type,ip,str_hash,hash_type \r\n",_CURR_TIME_STR);
+	update_fd(fd_start_file, timetmp, "./tracker_log/start_file", buf);
+	update_fd(fd_start_playlist, timetmp1, "./tracker_log/start_playlist", buf);
+}
+
+void LogManager::update_downloadfileinfofd()
+{
+	char buf[1024];
+	memset(buf, 0, sizeof(buf));
+	static string timetmp = m_curr_date;
+	static string timetmp1 = m_curr_date;
+#ifdef SM_MODIFY
+	sprintf(buf,"\r\n<br>[%s]:flag,      uid,     nattype,	 ip,      str_hash, "
+				"   hash_type(filesize, speed_KB, downseconds, cacheTimes, dragTimes, cacheSeconds), "
+				"   c-s/f(TCP_TURN,TCP_TURN,UDP_CONN,UDP_TURN,UDP_THRU),"
+				"   s-KB(tcp, udp),"
+				"   d-IPT-KB(tcp, udp,http),"
+				"   d-UT-KB(client,server,http,center,super) \r\n",_CURR_TIME_STR);
+#else
+	sprintf(buf,"\r\n<br>[%s]:flag,      uid,      ip,      str_hash, "
+				"   hash_type(filesize, speed_KB, downseconds, cacheTimes, dragTimes, cacheSeconds), "
+				"   c-s/f(TCP_TURN,TCP_TURN,UDP_CONN,UDP_TURN,UDP_THRU),"
+				"   s-KB(tcp, udp),"
+				"   d-IPT-KB(tcp, udp,http),"
+				"   d-UT-KB(client,server,http,center,super) \r\n",_CURR_TIME_STR);
+#endif /* end of SM_MODIFY */
+	update_fd(fd_speed_file, timetmp, "./tracker_log/speed_file", buf);
+	update_fd(fd_speed_playlist,  timetmp1, "./tracker_log/speed_playlist", buf);
+}
+
+void LogManager::update_downloadinfofd()
+{
+	char buf[1024];
+	memset(buf, 0, sizeof(buf));
+	static string timetmp = m_curr_date;
+	
+	sprintf(buf,"\r\n<br>[%s]: 1-request_files, 2-tcp_download_flow, 3-udp_download_flow, 4-http_download_flow,"
+				" 5-edge_download_flow, 6-client_download_flow, 7-center_download_flow, 8-super_download_flow,"
+				" 9-tcp_connect_success, 10-tcp_connect_fail, 11-tcp_accept_success, 12-tcp_accept_fail, 13-udp_connect_success, 14-udp_connect_fail,"
+				" 15-udp_receive_success, 16-udp_receive_fail, 17-udp_nat_success, 18-udp_nat_fail\r\n",_CURR_TIME_STR);
+	update_fd(fd_downinfo, timetmp, "./tracker_log/downinfo", buf);
+}
+
+void LogManager::update_realtimeinfofd()
+{
+	char buf[1024];
+	memset(buf, 0, sizeof(buf));
+	static string timetmp = m_curr_date;
+	
+	sprintf(buf,"\r\n<br>[%s]:  online_users,  edge_servers,  center_servers,  super_servers,"
+				"  online_progs,  online_sources,"
+				"  nat_0,  nat_1,  nat_2,  nat_3,  nat_4,  nat_5 \r\n",_CURR_TIME_STR);
+	update_fd(fd_realtimeinfo, timetmp, "./tracker_log/realtimeinfo", buf);
+}
+
+#endif
+
+#ifdef SM_MODIFY	
+#define _FD_REOPEN(_fd, _prename) {\
+		if(NULL == _fd) {\
+			char _buf[1024];\
+			memset(_buf, 0, sizeof(_buf));\
+			string curr_date = format_curr_day();\
+			sprintf(_buf,"%s_%s.log",_prename, curr_date.c_str());\
+			_FOPEN_RETURN(_fd, _buf)\
+			_FD_NULL_RETURN(_fd);\
+		}\
+	} 
+#endif
+
+#define _FD_NULL_RETURN(fd) if(NULL==fd) return
+void LogManager::on_userlogin(DBUserLogin *inf)
+{
+#ifdef SM_MODIFY	
+	update_userloginfd();
+	_FD_REOPEN(fd_login, "./tracker_log/login");
+#else
+	_FD_NULL_RETURN(fd_login);
+#endif
+	sprintf(_tmpbuf,"<br>[%s]: '%s',%5d,%5d,%5d, '%s' \r\n",_CURR_TIME_STR,inf->uid,inf->peer_type,inf->prog_ver,inf->os_ver,Util::ip_htoas(inf->ip).c_str());
+	_FPUTS_FLUSH(_tmpbuf,fd_login);
+}
+
+void LogManager::on_userloginout(DBUserLoginOut *inf)
+{
+#ifdef SM_MODIFY	
+	update_userloginoutfd();
+	_FD_REOPEN(fd_loginout, "./tracker_log/loginout");
+#else
+	_FD_NULL_RETURN(fd_loginout);
+#endif
+
+	sprintf(_tmpbuf,"<br>[%s]: '%s' ,f-d-u: %10d,%10d,%10d \r\n",_CURR_TIME_STR,inf->uid,inf->file_num,inf->download_flow,inf->upload_flow);
+	_FPUTS_FLUSH(_tmpbuf,fd_loginout);
+}
+
+void LogManager::on_startfile(DBStartFile *inf)
+{
+#ifdef SM_MODIFY	
+	update_startfilefd();
+	_FD_REOPEN(fd_start_file, "./tracker_log/start_file");
+	_FD_REOPEN(fd_start_playlist, "./tracker_log/start_playlist");
+#else
+	_FD_NULL_RETURN(fd_start_file);
+	_FD_NULL_RETURN(fd_start_playlist);
+#endif
+
+	sprintf(_tmpbuf,"<br>[%s]: '%s' ,%5d, '%s',  '%s',%5d \r\n",_CURR_TIME_STR,inf->uid,inf->user_type,Util::ip_htoas(inf->ip).c_str(),inf->str_hash,inf->hash_type);
+	if(HT_URLDL==inf->hash_type)
+	{
+		_FPUTS_FLUSH(_tmpbuf,fd_start_playlist);
+	}
+	else
+	{
+		_FPUTS_FLUSH(_tmpbuf,fd_start_file);
+	}
+}
+
+void LogManager::on_downloadfileinfo(DBDownloadFileInfo *inf)
+{
+#ifdef SM_MODIFY	
+	update_downloadfileinfofd();
+	_FD_REOPEN(fd_speed_file, "./tracker_log/speed_file");
+	_FD_REOPEN(fd_speed_playlist, "./tracker_log/speed_playlist");
+#else
+	_FD_NULL_RETURN(fd_speed_file);
+	_FD_NULL_RETURN(fd_speed_playlist);
+#endif
+
+	PTL_P2T_ReportDownloadFileInfo& df = inf->df;
+	_tmphash.set_buffer((unsigned char*)inf->df.fhash);
+	_tmphash.to_string(_tmpstrhash,HASHLEN);
+#ifdef SM_MODIFY	
+	sprintf(_tmpbuf,"<br>[%s]:%d, '%s' , %d, '%s' , '%s', "
+		"   %d(%10lld,%6d KB, %d S, %d, %d, %d), "
+		"   c-s/f(%d/%d, %d/%d, %d/%d, %d/%d, %d/%d),"
+		"   s-KB(%d, %d),"
+		"   d-IPT-KB(%d, %d, %d),"
+		"   d-UT-KB(%d, %d, %d, %d, %d) \r\n",
+		_CURR_TIME_STR,(int)inf->df.flag,inf->uid,inf->nattype,Util::ip_htoas(inf->ip).c_str(),_tmpstrhash,
+#else
+	sprintf(_tmpbuf,"<br>[%s]:%d, '%s' , '%s' , '%s', "
+		"   %d(%10lld,%6d KB, %d S, %d, %d, %d), "
+		"   c-s/f(%d/%d, %d/%d, %d/%d, %d/%d, %d/%d),"
+		"   s-KB(%d, %d),"
+		"   d-IPT-KB(%d, %d, %d),"
+		"   d-UT-KB(%d, %d, %d, %d, %d) \r\n",
+		_CURR_TIME_STR,(int)inf->df.flag,inf->uid,Util::ip_htoas(inf->ip).c_str(),_tmpstrhash,
+#endif /* end of SM_MODIFY */
+		(int)_tmphash.hash_type(),df.size,df.speed_KB,df.downSeconds,df.cacheTimes,df.dragTimes,df.cacheSenconds,
+		df.connSucceedPerNetT[0],df.connFailedPerNetT[0],df.connSucceedPerNetT[1],df.connFailedPerNetT[1],df.connSucceedPerNetT[2],df.connFailedPerNetT[2],
+		df.connSucceedPerNetT[3],df.connFailedPerNetT[3],df.connSucceedPerNetT[4],df.connFailedPerNetT[4],
+		df.shareBytesPerIPT_KB[0],df.shareBytesPerIPT_KB[1],
+		df.downBytesPerIPT_KB[0],df.downBytesPerIPT_KB[1],df.downBytesPerIPT_KB[2],
+		df.downBytesPerUserT_KB[0],df.downBytesPerUserT_KB[1],df.downBytesPerUserT_KB[2],df.downBytesPerUserT_KB[3],df.downBytesPerUserT_KB[4]);
+
+
+	if(HT_URLDL==_tmphash.hash_type())
+	{
+		_FPUTS_FLUSH(_tmpbuf,fd_speed_playlist);
+	}
+	else
+	{
+		_FPUTS_FLUSH(_tmpbuf,fd_speed_file);
+	}
+}
+void LogManager::on_downloadinfo(DBDownloadInfo *inf)
+{
+#ifdef SM_MODIFY	
+	update_downloadinfofd();
+	_FD_REOPEN(fd_downinfo, "./tracker_log/downinfo");
+#else
+	_FD_NULL_RETURN(fd_downinfo);
+#endif
+
+	sprintf(_tmpbuf,"<br>[%s]:f-t-u-h: %10d,%10d,%10d,%10d,"
+		"  e-c-c-s: %10d,%10d,%10d,%10d,"
+		"  conn: %10d,%10d,%10d,%10d,%10d,%10d,"
+		"%10d,%10d,%10d,%10d \r\n",_CURR_TIME_STR,
+		inf->request_files,inf->tcp_download_flow,inf->udp_download_flow,inf->http_download_flow,
+		inf->edge_download_flow,inf->client_download_flow,inf->center_download_flow,inf->super_download_flow,
+		inf->tcp_connect_success,inf->tcp_connect_fail,inf->tcp_accept_success,inf->tcp_accept_fail,inf->udp_connect_success,inf->udp_connect_fail,
+		inf->udp_receive_success,inf->udp_receive_fail,inf->udp_nat_success,inf->udp_nat_fail);
+	_FPUTS_FLUSH(_tmpbuf,fd_downinfo);
+}
+
+void LogManager::on_realtimeinfo(DBRealTimeInfo *inf)
+{
+#ifdef SM_MODIFY	
+	update_realtimeinfofd();
+	_FD_REOPEN(fd_realtimeinfo,  "./tracker_log/realtimeinfo");
+#else
+	_FD_NULL_RETURN(fd_realtimeinfo);
+#endif
+	
+	sprintf(_tmpbuf,"<br>[%s]:U-S: %10d,%10d,%10d,%10d,"
+		"  P-S: %10d,%10d,"
+		"  NAT: %10d,%10d,%10d,%10d,%10d,%10d \r\n",_CURR_TIME_STR,
+		inf->online_users,inf->edge_servers,inf->center_servers,inf->super_servers,
+		inf->online_progs,inf->online_sources,
+		inf->nat_0,inf->nat_1,inf->nat_2,inf->nat_3,inf->nat_4,inf->nat_5);
+	_FPUTS_FLUSH(_tmpbuf,fd_realtimeinfo);
+}

@@ -1,0 +1,707 @@
+#include "DownloadSource.h"
+#include "FileStorage.h"
+#include "Statistician.h"
+#include "PeerManager.h"
+#include "Setting.h"
+#include "Tracker.h"
+#include "DownloadManager.h"
+#include "HashManager.h"
+#include "Util.h"
+#include "IniFile.h"
+#include "DownloadListManager.h"
+
+#ifdef SM_DBG
+#define DOWNLOADSOURCE_PRT(fmt, arg...) fprintf(stdout, "[%s(%s):%d] "fmt, __FUNCTION__, "DownloadSource",__LINE__, ##arg)
+#else
+#define DOWNLOADSOURCE_PRT(fmt, arg...)
+#endif
+
+
+//1维为自己nat类型，2维为目标类型
+int g_ConnectionType[7][7] = 
+{
+	{TCP_CONN,TCP_TURN,TCP_TURN,TCP_TURN,TCP_TURN,TCP_TURN,UNUSABLE},
+	{TCP_CONN,UDP_CONN,UDP_CONN,UDP_CONN,UDP_CONN,UNUSABLE,UNUSABLE},
+	{TCP_CONN,UDP_CONN,UDP_CONN,UDP_CONN,UDP_CONN,UNUSABLE,UNUSABLE},
+	{TCP_CONN,UDP_CONN,UDP_CONN,UDP_CONN,UNUSABLE,UNUSABLE,UNUSABLE},
+	{TCP_CONN,UDP_CONN,UDP_CONN,UNUSABLE,UNUSABLE,UNUSABLE,UNUSABLE},
+	{TCP_CONN,UNUSABLE,UNUSABLE,UNUSABLE,UNUSABLE,UNUSABLE,UNUSABLE},
+	{TCP_CONN,UDP_CONN,UDP_CONN,UDP_CONN,UNUSABLE,UNUSABLE,UNUSABLE}
+};
+
+DownloadSource::DownloadSource(void)
+: Speaker<DownloadListener>(1)
+, m_state(DOWNS_INIT)
+, m_fi(NULL)
+, m_isFinished(false)
+, m_isUseClientSNOnly(false)
+, m_isAssignJobPause(false)
+, m_lastPauseNeedI(0)
+, m_iConnectAmount(0)
+, m_iCurrTick(0)
+, m_iLastCreateConnectTick(0)
+, m_assign_fails(0)
+{
+}
+
+DownloadSource::~DownloadSource(void)
+{
+}
+
+int DownloadSource::on_peer_turn(Peer *peer,int sessionID)
+{
+	SourceIter it = m_sources.find(sessionID);
+	if(it!=m_sources.end())
+	{
+		if(peer)
+		{
+			if(0==attach_peer(peer,true,TCP_TURN))
+				return 0;
+		}
+		it->second->lastUseTick = m_iCurrTick;
+		it->second->ref--;
+		if(!peer)
+		{
+			it->second->connectFailTimes++;
+			if(HT_URL2==m_fi->hash.hash_type())
+				DownloadListManagerSngl::instance()->on_peer_connect_failed(m_fi->hash,it->second->source.sessionID);
+			if(it->second->connectFailTimes>=1)
+			{
+				delete it->second;
+				m_sources.erase(it);
+			}
+			//返连接失败,但不知道是TCU返连接还是UDP返连接
+		}
+	}
+	return -1;
+}
+
+int DownloadSource::get_source_list(list<SourceInfo*>& ls)
+{
+	SourceInfo *inf = NULL;
+	for(SourceIter it=m_sources.begin();it!=m_sources.end();++it)
+	{
+		inf = new SourceInfo();
+		if(!inf)
+			break;
+		*inf = *it->second;
+		ls.push_back(inf);
+	}
+	return ls.size();
+}
+int DownloadSource::add_source_list(list<SourceInfo*>& ls)
+{
+	DEBUGMSG("#DownloadSource::add source - %d \n",ls.size());
+	SourceInfo* inf = NULL;
+	SourceInfo* inf2=NULL;
+	for(list<SourceInfo*>::iterator it=ls.begin();it!=ls.end();++it)
+	{
+		inf = *it;
+		inf2 = add_source(&inf->source);
+		if(inf2)
+		{
+			inf2->noDataTimes = inf->noDataTimes;
+			inf2->connectFailTimes = inf->connectFailTimes;
+			inf2->ctype = inf->ctype;
+		}
+		DOWNLOADSOURCE_PRT("add source sessionID:%d\n", inf->source.sessionID);
+	}
+	if(!ls.empty())
+		check_create_channel();
+	return 0;
+}
+SourceInfo* DownloadSource::add_source(PTL_P2T_PeerInfo* source)
+{
+	if(!source || source->sessionID == g_netLiveInfo.sessionID || source->utype<1)
+		return NULL;
+	//自己未取到外网IP前不要匹配
+	if(6!=g_netLiveInfo.natType && g_netLiveInfo.tcpRealIP && g_netLiveInfo.tcpRealIP!=source->tcpRealIP
+		&& UNUSABLE==g_ConnectionType[(int)g_netLiveInfo.natType][(int)source->ntype] )
+		return NULL;
+	//如果session存在就替换
+	SourceIter it = m_sources.find(source->sessionID);
+	if(it!=m_sources.end())
+	{
+		it->second->source = *source;
+		return NULL;
+	}
+	//如果是服务器类型,可能load本地cache server已经存在的话，就不再需要。
+	if(source->utype == UT_SERVER)
+	{
+		for(SourceIter it=m_sources.begin();it!=m_sources.end();++it)
+		{
+			if(it->second->source.tcpRealIP == source->tcpRealIP && it->second->source.tcpRealPort == source->tcpRealPort)
+				return NULL;
+		}
+	}
+	SourceInfo *inf = new SourceInfo();
+	inf->source = *source;
+	m_sources[source->sessionID] = inf;
+	for(PeerIter pi=m_peers.begin();pi!=m_peers.end();++pi)
+	{
+		if(pi->first->get_sessionID()==inf->source.sessionID && pi->second->isMySource)
+		{
+			inf->ref++;
+			inf->lastUseTick = m_iCurrTick;
+			inf->connectTimes++;
+		}
+	}
+	return inf;
+}
+
+int DownloadSource::clear_source_all()
+{
+	for(SourceIter it=m_sources.begin();it!=m_sources.end();++it)
+	{
+		//assert(it->second->ref==0);//返连接的可能未清理
+		delete it->second;
+	}
+	m_sources.clear();
+	return 0;
+}
+void DownloadSource::load_source_server_cache()
+{
+	//if(m_isUseClientSNOnly)
+	//	return;
+	//PTL_P2T_PeerInfo peer[30];
+	//int n=SourceServerCacheSngl::instance()->GetSourceServer(peer,20);
+	//for(int i=0;i<n;++i)
+	//	this->add_source(&peer[i]);
+	//create_channel();
+}
+void DownloadSource::load_client_sn()
+{
+	//
+	static unsigned int _min_sessionID=2000000;
+	int isonly = 0;
+	char buf[1024];
+	memset(buf,0,1024);
+	string str,sns,strIP,strPort;
+	PTL_P2T_PeerInfo peer;
+	GetPrivateProfileStringA("sn","sns","",buf,1024,SettingSngl::instance()->get_confini_path().c_str());
+	isonly = GetPrivateProfileIntA("sn","snonly",0,SettingSngl::instance()->get_confini_path().c_str());
+	sns = buf;
+	if(sns.empty())
+		return;
+	int n = Util::get_string_index_count(sns,"|");
+
+	peer.ntype = 0;
+	peer.utype = UT_CLIENT;
+	peer.menu = 7;
+	peer.udpRealIP = 0;
+	peer.udpRealPort = 0;
+	peer.udpLocalIP = 0;
+	peer.udpLocalPort = 0;
+	peer.tcpLocalIP = 0;
+	peer.tcpLocalPort = 0;
+	int j = 0;
+	for(int i=0;i<n;++i)
+	{
+		str = Util::get_string_index(sns,i,"|");
+		strIP = Util::get_string_index(str,0,":");
+		strPort = Util::get_string_index(str,1,":");
+		Util::string_trim(strIP);
+		Util::string_trim(strPort);
+		if(strIP.empty() || strPort.empty())
+			continue;
+		peer.ntype = (char)atoi(Util::get_string_index(str,2,":").c_str());
+		peer.sessionID = _min_sessionID++;
+		peer.tcpRealIP = Util::ip_atoh(strIP.c_str());
+		peer.tcpRealPort = atoi(strPort.c_str());
+
+		peer.udpRealIP = peer.tcpRealIP;
+		peer.udpRealPort = peer.tcpRealPort;
+		add_source(&peer);
+		j++;
+	}
+	if(j>0)
+	{
+		if(isonly)
+			m_isUseClientSNOnly = true;
+		//create_channel();
+	}
+}
+
+int DownloadSource::attach_peer(Peer *peer,bool isMySource/*=false*/,int ctype/*=0*/)
+{
+	if(DOWNS_START!=m_state || m_isFinished)
+		return -1;
+
+	PeerData *data = new PeerData();
+	data->isMySource = isMySource;
+	data->ctype = ctype;
+	data->sourceSessionID = peer->get_sessionID();
+	if(m_fi->size>0)
+		data->bt_finished.resize(m_fi->blocks,m_fi->block_offset,false);
+	m_peers[peer] = data;
+	m_iConnectAmount++;
+	PeerManagerSngl::instance()->add_dref(this,peer);
+	peer->set_PeerReadLimitSinker(this);
+	return 0;
+}
+
+int DownloadSource::detach_peer(Peer *peer,bool reattach/*=false*/,bool bunsed/*=false*/,bool bput_all/*=false*/)
+{
+	PeerIter it=m_peers.find(peer);
+	if(it==m_peers.end())
+	{
+		assert(0);
+		return -1;
+	}
+	int ctype = 0;
+	peer->set_PeerReadLimitSinker(NULL);
+	PeerData *data = it->second;
+	ctype = data->ctype;
+	cancel_job(peer);
+	m_peers.erase(it);
+	if(PS_ASSIGN_FAIL_WAITING == data->state)
+	{
+		m_assign_fails--;
+	}
+
+	if(data->isReady)
+		StatisticianSngl::instance()->OnConnectionSpeed(peer->get_channel()->get_hip(),data->speedometer.get_speed(),
+		data->speedometer.get_sec_amount(),peer->get_ip_type(),peer->get_user_type(),true);
+	if(data->isMySource)
+	{
+		SourceIter it2 = m_sources.find(data->sourceSessionID);
+		if(it2!=m_sources.end())
+		{
+			it2->second->lastUseTick = m_iCurrTick;
+			it2->second->ref--;
+			if(0==data->speedometer.get_total())
+				it2->second->noDataTimes++;
+			else
+			{
+				it2->second->noDataTimes=0;
+				if(HT_URL2==m_fi->hash.hash_type())
+					DownloadListManagerSngl::instance()->on_peer_req_havedata(m_fi->hash,it2->second->source.sessionID);
+			}
+			if(bunsed || it2->second->noDataTimes>=8)
+			{
+				if(HT_URL2==m_fi->hash.hash_type())
+					DownloadListManagerSngl::instance()->on_peer_req_nodata(m_fi->hash,it2->second->source.sessionID);
+				//3次以上获取不到数据，也删除
+				delete it2->second;
+				m_sources.erase(it2);
+				DEBUGMSG("#*** no data erase peer source! \n");
+			}
+			else if(!data->isReady)
+			{
+				//注意:在刚刚连接然后停止任务的时候，这不一定是失败，会导致误判1次失败，如果同一个源连接多次，误判多次
+				reattach = false;
+				if(!bput_all)
+				{
+					it2->second->connectFailTimes++;
+					if(HT_URL2==m_fi->hash.hash_type())
+						DownloadListManagerSngl::instance()->on_peer_connect_failed(m_fi->hash,it2->second->source.sessionID);
+				}
+				//连续2次连接失败，则放弃源，1次失败可能性比较大，特别在限制半开连接数5个的时候，并发连接量大会出现
+				if(it2->second->connectFailTimes>=2)
+				{
+					if(UT_SERVER==it2->second->source.utype)
+					{
+						//清理cache,没连网也不考虑
+						//SourceServerCacheSngl::instance()->DelSourceServer(it2->second->source.sessionID);
+					}
+					delete it2->second;
+					m_sources.erase(it2);
+				}
+			}
+			else
+			{
+				it2->second->connectFailTimes=0;
+				if(UT_SERVER==it2->second->source.utype && 0==it2->second->source.ntype)
+				{
+					//SourceServerCacheSngl::instance()->AddSourceServer(&it2->second->source);
+				}
+				if(PS_NOTHING_TO_DOWNLOAD == data->state)
+				{
+					//对方下载的内容比我少.没有我可以下载的内容
+					delete it2->second;
+					m_sources.erase(it2);
+				}
+			}
+		}
+	}
+
+	delete data;
+	m_iConnectAmount--;
+	if(HT_URL2==m_fi->hash.hash_type() && reattach)
+	{
+		//普通peer的连接传递不需要考虑连接是否还存在剩余数据发过来
+		if(0==DownloadListManagerSngl::instance()->on_peer_reattach(m_fi->hash,peer,ctype))
+			return 0;
+		else
+		{
+			DEBUGMSG("# ****** peer reattach failed ********!!!\n");
+		}
+	}
+	PeerManagerSngl::instance()->del_dref(this,peer);
+	return 0;
+}
+
+int DownloadSource::put_peer_all()
+{
+	while(!m_peers.empty())
+		detach_peer(m_peers.begin()->first,true,false,true);
+	return 0;
+}
+int DownloadSource::check_create_channel()
+{
+	if(DOWNS_START==m_state && !m_isFinished)
+		create_channel();
+	return 0;
+}
+int DownloadSource::create_channel()
+{
+	int count = SettingSngl::instance()->get_downloadi_cnns();
+	if(count<0) count = 100;
+	count -= m_iConnectAmount;
+	if(count<=0)
+		return 0;
+	
+	m_iLastCreateConnectTick = m_iCurrTick;
+	int n=0,max_ref=0;
+	SourceInfo* inf;
+	for(SourceIter it=m_sources.begin();it!=m_sources.end();)
+	{
+		inf = it->second;
+		////test: 只连接
+		//if(inf->source.ntype==0)
+		//{
+		//	++it;
+		//	continue;
+		//}
+		if(UT_SERVER==inf->source.utype || UT_CENTER==inf->source.utype)
+		{
+			max_ref = SettingSngl::instance()->get_sn_multinum();
+			DEBUGMSG("# sn multinum : %d \n",max_ref);
+		}
+		else
+			max_ref = 1;
+
+		//使用super源过滤
+		if(UT_SUPER==inf->source.utype && !SettingSngl::instance()->get_is_use_super())
+		{
+			++it;
+			continue;
+		}
+
+		if(inf->ref>=max_ref)
+		{
+			++it;
+			continue;
+		}
+
+		if(it->second->connectFailTimes>2)
+		{
+			delete it->second;
+			m_sources.erase(it++);
+			continue;
+		}
+		if(0==it->second->connectTimes || (it->second->lastUseTick+5)<m_iCurrTick)
+		{
+			if(UNKNOW==it->second->ctype && g_netLiveInfo.tcpRealIP)
+			{
+				it->second->ctype = get_connect_type(*it->second);
+				if(UNUSABLE==it->second->ctype)
+				{
+					delete it->second;
+					m_sources.erase(it++);
+					continue;
+				}
+			}
+			for(int i=inf->ref;i<max_ref;++i)
+			{
+				if(-1 != create_channel_i(*it->second))
+				{
+					n++;
+					if(n==count)
+						break;
+				}
+			}
+			
+			if(n==count)
+				break;
+		}
+		++it;
+	}
+	return n;
+}
+
+int DownloadSource::create_channel_i(SourceInfo& inf)
+{
+	int ret=-1;
+	uint32 ip=0;
+	uint16 port=0;
+	Peer *peer = NULL;
+	int nattype = inf.source.ntype;
+	int type = inf.ctype;
+	if(type == UNKNOW)
+		type = get_connect_type(inf);
+
+	//////test:
+	//type = LOCAL_UDP;
+	DOWNLOADSOURCE_PRT("will create p2p channel, type=%d\n", type);
+	switch(type)
+	{
+	case UNUSABLE:
+		{
+		}
+		break;
+	case TCP_CONN:
+		{
+			ip=inf.source.tcpRealIP;
+			port=inf.source.tcpRealPort;
+			peer = PeerManagerSngl::instance()->get_peer(IPT_TCP,TCP_CONN,NULL,false);
+			if(peer)
+			{
+				ret = peer->connect(ip,port,nattype);
+				assert(0==ret);
+			}
+		}
+		break;
+	case TCP_TURN:
+		{
+			if(DownloadManagerSngl::instance()->create_turn_channel(inf.source.trackID,inf.source.sessionID,m_fi->hash))
+				ret=0;
+		}
+		break;
+	case UDP_CONN:
+		{
+			ip=inf.source.udpRealIP;
+			port=inf.source.udpRealPort;
+			peer = PeerManagerSngl::instance()->get_peer(IPT_UDP,UDP_CONN,NULL,false);
+			if(peer)
+			{
+				ret = peer->connect(ip,port,nattype);
+				assert(0==ret);
+			}
+		}
+		break;
+	case LOCAL_TCP:
+		{
+			ip=inf.source.tcpLocalIP;
+			port=inf.source.tcpLocalPort;
+			peer = PeerManagerSngl::instance()->get_peer(IPT_TCP,LOCAL_TCP,NULL,false);
+			if(peer)
+			{
+				ret = peer->connect(ip,port,nattype);
+				assert(0==ret);
+			}
+		}
+		break;
+	case LOCAL_UDP:
+		{
+			ip=inf.source.udpLocalIP;
+			port=inf.source.udpLocalPort;
+			peer = PeerManagerSngl::instance()->get_peer(IPT_UDP,LOCAL_UDP,NULL,false);
+			if(peer)
+			{
+				ret = peer->connect(ip,port,nattype);
+				assert(0==ret);
+			}
+		}
+		break;
+	default:
+		assert(0);
+		break;
+	}
+
+	if(peer)
+	{
+		DOWNLOADSOURCE_PRT("create peer(%d:%d) sessinID:%dn", ip, port, inf.source.sessionID);
+		peer->set_user_type(inf.source.utype);
+		peer->set_sessionID(inf.source.sessionID);
+		if(0==ret)
+			ret = attach_peer(peer,true,type);
+		if(0!=ret)
+			PeerManagerSngl::instance()->put_peer(peer);
+	}
+ 
+	if(0==ret)
+	{
+		inf.lastUseTick = m_iCurrTick;
+		inf.connectTimes++;
+		inf.ref++;
+	}
+	return ret;
+}
+
+int DownloadSource::get_connect_type(const SourceInfo& inf)
+{
+	int type = UNUSABLE;
+	if(g_netLiveInfo.tcpRealIP==inf.source.tcpRealIP)
+	{
+		if(inf.source.tcpLocalIP && inf.source.tcpLocalPort)
+			type = LOCAL_TCP;
+		else if(inf.source.udpLocalIP &&inf.source.udpLocalPort)
+			type = LOCAL_UDP;
+		else
+			type=g_ConnectionType[(int)g_netLiveInfo.natType][(int)inf.source.ntype];
+	}
+	else
+		type=g_ConnectionType[(int)g_netLiveInfo.natType][(int)inf.source.ntype];
+	switch(type)
+	{
+	case TCP_CONN:
+		{
+			if(!inf.source.tcpRealIP || !inf.source.tcpRealPort)
+			{
+				if(0==g_netLiveInfo.natType)
+					type = TCP_TURN;
+				else if(inf.source.udpRealIP && inf.source.udpRealPort)
+					type = UDP_CONN;
+				else
+					type = UNUSABLE;
+			}
+		}
+		break;
+	case TCP_TURN:
+		{
+		}
+		break;
+	case UDP_CONN:
+		{
+			if(!inf.source.udpRealIP || !inf.source.udpRealPort)
+				type = UNUSABLE;
+		}
+		break;
+	case LOCAL_TCP:
+	case LOCAL_UDP:
+	case UNUSABLE:
+		break;
+	default:
+		assert(0);
+		break;
+	}
+	return type;
+}
+
+DownloadSource::PeerData* DownloadSource::get_peerdata(Peer* peer)
+{
+	PeerIter it=m_peers.find(peer);
+	if(it!=m_peers.end())
+		return it->second;
+	return NULL;
+}
+int DownloadSource::update_filesize(size64_t size)
+{
+	if(size>0&&0==m_fi->size)
+	{
+		FileStorageSngl::instance()->update_downinfo_size(m_fi->hash,size);
+		m_downInfo.size = size;
+		m_downInfo.blocks = m_fi->blocks;
+		m_downInfo.down_blocks = m_fi->down_blocks;
+		return 0;
+	}
+	return -1;
+}
+
+int DownloadSource::get_block_speed(int index,int seconds)
+{
+	int speed = 0,tmp=0;
+	BlockRefIter it = m_blockRefs.find(index);
+	if(it==m_blockRefs.end())
+	{
+		return 0;
+	}
+	list<Peer*>& ls = it->second;
+	for(list<Peer*>::iterator it=ls.begin();it!=ls.end();++it)
+	{
+		tmp = get_peerdata(*it)->speedometer.get_speed(seconds);
+		if(tmp>speed)
+			speed = tmp;
+	}
+	return speed;
+}
+int DownloadSource::add_block_ref(int index,Peer* peer)
+{
+	m_blockRefs[index].push_back(peer);
+	return 0;
+}
+int DownloadSource::del_block_ref(int index,Peer* peer)
+{ 
+	BlockRefIter it=m_blockRefs.find(index);
+	if(it!=m_blockRefs.end())
+	{
+		it->second.remove(peer);
+		if(it->second.empty())
+			m_blockRefs.erase(it);
+		return 0;
+	}
+	return -1;
+}
+int DownloadSource::get_block_ref_num(int index)
+{
+	BlockRefIter it=m_blockRefs.find(index);
+	if(it==m_blockRefs.end())
+		return 0;
+	return (int)it->second.size();
+}
+
+bool DownloadSource::is_urgent_win_ok(int need_i)
+{
+	//检查urgent_win块
+	int blocks = m_fi->block_offset + m_fi->blocks;
+	int urgent_win = need_i+SettingSngl::instance()->get_urgent_win();
+	//int up = m_fi->bt_memfinished.get_block_num() + m_fi->bt_finished.get_block_offset();
+	for(int i=need_i;i<blocks&&i<urgent_win;++i)
+	{
+		if(!m_fi->bt_memfinished[i])
+			return false;
+	}
+	return true;
+}
+
+int DownloadSource::on_block_done(int index,int type)
+{
+	//DEBUGMSG("#:BF: [%d]-(%d)\n",type,index);
+	FileStorageSngl::instance()->on_blockdone(m_fi->hash,index);
+	////test
+	//if(43==index)
+	//	int a=0;
+	//有5M数据开始共享
+	if(m_fi->down_blocks == MIN_SHARE_BLOCKS) {
+#ifdef SM_VOD
+		TrackerSngl::instance()->PTL_ReportShareFile(m_fi->hash, m_playtype);
+		DOWNLOADSOURCE_PRT("report share file, type=%d\n", _get_playtype());
+#else
+		TrackerSngl::instance()->PTL_ReportShareFile(m_fi->hash);
+#endif /* end of SM_VOD */
+	}
+
+	fire(DownloadListener::DLBlockTable(),m_fi->hash,m_fi->bt_memfinished);
+	fire(DownloadListener::DLBlockDone(),m_fi->hash,index);
+	//this->auto_change_demand_point(false);
+	if(m_fi->is_finished())
+		on_file_done();
+	if(m_fi->check_memcache_done())
+		on_file_memcache_done();
+	return 0;
+}
+
+int DownloadSource::on_file_done()
+{
+	DEBUGMSG("#:Download filedone! \n");
+	m_downInfo.down_blocks = m_fi->blocks;
+	m_isFinished = true;
+#ifdef SM_VOD
+	DOWNLOADSOURCE_PRT("<<<<<<<<<<<<<playtype=%d\n", m_playtype);
+	HashManagerSngl::instance()->check_filehash(m_fi->hash,m_playtype,m_fi->path,1);
+#else
+	HashManagerSngl::instance()->check_filehash(m_fi->hash,m_fi->path,1);
+#endif
+	return 0;
+}
+
+int DownloadSource::on_file_memcache_done()
+{
+	DEBUGMSG("#:Download file memcache done! \n");
+	m_downInfo.down_blocks = m_fi->blocks;
+	m_isFinished = true;
+	HashManagerSngl::instance()->check_filehash(m_fi->hash,m_fi->path,2);
+	return 0;
+}
+

@@ -1,0 +1,215 @@
+#pragma once
+#include "HttpGet.h"
+#include "DownloadSource.h"
+#include "MessageInfo.h"
+
+//HT_URL2类型的download任务，拥有一个主下载的DL令牌概念。一个downloadlist同一时刻只有一个下载获得DL令牌
+//1。拥有DL令牌的下载才允许创建新连接
+//2。拥有DL令牌的任务停止或者完成时令牌回收，并获取它的所有源将源传递给下一个下载，先交接完令牌再赋源，赋源时注意查是否有对应的peer把引用递增
+//3。搜索回来的源只传递给拥有DL令牌的下载，也就是说HT_URL2没令牌的不会有源
+//4。HT_URL2类型的download任务，detach_peer()时，peer尝试传递下一个任务下载（源不传递）
+//5。HT_URL2类型的download任务，任务快结束时注意抢下载策略避免过多的垃圾下载
+//6。主下载的最后块下载过慢目前不考虑从其它下载任务回调peer过来抢下载，或者考虑新创建连接来解决
+class DownloadList : private HttpGetListener
+{
+	enum {FN_IDLE=0,FN_DOWNING,FN_FINISHED,FN_MEMCACHE_FINISHED};
+	typedef struct tagFileNode
+	{
+		string url;
+		string local_url; //http://127.0.0.1:7080/playlist/file/hash/name
+		string local_path; // add for export playlist 
+		hash_t hash;
+		int i; //排号
+		int state;
+		bool is_line_no; //是否是最新更新列表里面的，返回给播放器只返回最新更新到的
+		char read_ref;
+#ifdef SM_VOD
+		float time;
+#endif
+		tagFileNode(void) :i(0), state(FN_IDLE),is_line_no(false),read_ref(0) {}
+	}FileNode;
+
+	typedef list<FileNode> FileList;
+	typedef FileList::iterator FileIter;
+	typedef struct tagDLData
+	{
+		string plurl;
+		string plurl_org;
+		string plurl_real;
+		string plname;
+		hash_t plhash;
+		string plstrhash;
+		string plpath; //本地保存路径
+		string pre_filename;
+		FileList fn_list;
+		list<string> origi_downlist; //原列表
+		unsigned int	file_i; //排号
+		unsigned int	fini_num; //一共下载完成多少个
+		list<int> fini_i_ls; //记录已经完成下载的序号
+		hash_t cur_fn;
+		unsigned int last_updatepl_tick;
+		hash_t		m_playlist_first_hash; //当前更新到最新列表的第1个hash
+		tagDLData(void) : file_i(0), fini_num(0),last_updatepl_tick(0){}
+	}DLData;
+
+	typedef struct tagDLStat
+	{
+		Speedometer<uint64>			speed;
+		Speedometer<uint64>			shareSpeed;
+		uint32						connSucceedPerNetT[5]; //下标:0，直接TCP连接；1，callback TCP；2，UDP直接连接；3，UDP callback；4，UDP nat hole 连接
+		uint32						connFailedPerNetT[5];
+		uint64						shareBytesPerIPT_B[2]; //共享了多少数据
+		uint64						downBytesPerIPT_B[3];   //下标:0-TCP; 1- UDP ;2-HTTP
+		uint64						downBytesPerUserT_B[6];   //0:UT_CLIENT;1:UT_SERVER;
+		
+		tagDLStat()
+		{
+			int i=0;
+			for(i=0;i<5;++i)
+				connSucceedPerNetT[i] = connFailedPerNetT[i] = 0;
+			for(i=0;i<2;++i)
+				shareBytesPerIPT_B[i] = 0;
+			for(i=0;i<3;++i)
+				downBytesPerIPT_B[i] = 0;
+			for(i=0;i<6;++i)
+				downBytesPerUserT_B[i] = 0;
+		}
+	}DLStat_t;
+
+	typedef list<SourceInfo*> SourceList;
+	typedef SourceList::iterator SourceIter;
+
+#ifdef SM_VOD
+	typedef struct tagPlaylist {
+		string content; // m3u8 content
+		string head; //head
+		string body; //body
+		list<string> lm3u8body; //body list
+
+		tagPlaylist(const char *cbuf): content(cbuf), head(""),body("") {
+			int pos_head = content.find("#EXTM3U");
+			int pos_body = content.find("#EXTINF");
+			if(!((pos_head < 0) && ( pos_body < 0) ))  {
+				/* get head */
+				head = content.substr(pos_head,pos_body);
+				body = content.substr(pos_body);
+				Util::get_stringlist_from_string(body, lm3u8body);
+			}
+		}
+	}DLPlaylist_t;
+#endif
+
+private:
+	DownloadList(void);
+	~DownloadList(void);
+public:
+	static DownloadList* open(const hash_t& hash,const string& url,const string& name,bool autoclose,bool bopenbytracker);
+#ifdef SM_VOD
+	static DownloadList* open(const hash_t& hash,const string& url,const string& name,bool autoclose,int playtype,bool bopenbytracker);
+	FileNode* create_download(FileNode* fn,bool check_next,bool is_token,bool use_url, int playtype);
+	int get_downloadcachetime(int& time);
+	//void set_main_download(bool btoken) { m_main_download = btoken;}
+	// bool is_main_download() { return (true==m_main_download);}
+	int get_fileurl(const hash_t& hash, string& url) ;
+	int get_filepath(const hash_t& hash, string& path) ;
+#endif
+	void close();
+	int get_downloadlist(list<string>& ls);
+	int need_download(const hash_t& hash); //具体文件的hash
+	int need_download_end(const hash_t& hash); //具体文件的hash
+
+	int on_response_source(PTL_P2T_ResponseFileSource& rsp);
+	hash_t& get_token_hash() {return m_token_hash;}
+	void on_tracker_connected();
+	void on_file_done(const hash_t& hash,char done_type);
+	void on_file_stop(const hash_t& hash,void* dl);
+	int on_peer_reattach(const hash_t& src_hash,Peer* peer,int ctype);
+	int on_http_peer_reattach(const hash_t& src_hash,HttpPeer* peer);
+	int on_peer_connect_failed(const hash_t& hash,unsigned int sessionID); //连接失败计数，失败多的丢弃源
+	int on_peer_req_nodata(const hash_t& hash,unsigned int sessionID); //一次连接完成，从连接中获取不到任何数据
+	int on_peer_req_havedata(const hash_t& hash,unsigned int sessionID); //一次连接完成，从连接中成功获取到过数据
+	bool is_openbytracker() const { return m_bopenbytracker;}
+	int on_download_bytes(const hash_t& hash,int size,int iptype,int utype);
+	int on_connection(const hash_t& hash,int ctype,bool succeed);
+	int on_share_bytes(const hash_t& hash,int size,int iptype);
+	void on_second();
+	int get_msg_downloadlist_info(MsgDownloadlistInfo_t *inf);
+	int get_msg_downloadlist_info2(MsgDownloadlistInfo2_t *inf);
+	bool check_auto_close() { if(m_autoclose && m_need_ref<1 && m_last_need_end_tick+120 < m_curr_tick) return true;  return false;}
+private:
+	void update_downloadlist();
+#ifdef SM_VOD
+	void update_downloadlist_ex();
+#endif
+	int set_info(const hash_t& hash,const string& url);
+	int start();
+	void stop();
+	void clear_cache();
+	FileNode* find(const hash_t& hash);
+	FileNode* find_next(const hash_t& hash,int state,const hash_t& exclude_hash);
+	int get_idle_num();
+	FileNode* create_download(FileNode* fn,bool check_next,bool is_token,bool use_url);
+	void read_release(FileNode* fn);
+	int set_token(FileNode* fn);
+	void check_create_download();
+	DownloadList::FileNode* check_create_next_download(const hash_t& hash,bool is_token,bool use_url);
+
+	int source_add(PTL_P2T_PeerInfo* source);
+	void source_clear_all();
+	void source_search();
+
+	virtual void on(HttpGetListener::Url302,HttpGet* hg,const string& newurl);
+	virtual void on(HttpGetListener::Response,HttpGet* hg,int result,const string& save_path,const char* rsp,int len);
+	void release_old_memcache();
+	bool check_memcache_ok_to_start(const hash_t& hash);
+	void ptl_report_downladfileinfo(int flag);
+
+	void ontimer_check_download_state();
+
+	//当>=cache_playlist_http_win_up 满时执行httpi,让P2P分享更多数据
+	//当<cache_playlist_http_win_down 时执行0
+	void update_http_max_num(int n); 
+
+	int get_afterneed_finished_num();
+	void check_http_pause();
+	void check_http_resume();
+	void get_connect_num(int& p2pconn,int& httpconn);
+private:
+	DLData		m_data;
+	HttpGet		m_httpget;
+	hash_t		m_token_hash; //当前主下载文件
+	unsigned int	m_token_i;
+	hash_t		m_curr_need_hash;
+	SourceList	m_p2p_sources;
+	bool        m_isUseClientSNOnly;
+	bool		m_bopenbytracker;
+	bool		m_need_download_updateing; //将要更新的
+	int			m_download_amount;
+	int			m_http_max_num;
+	unsigned int	m_begin_time;
+	unsigned int	m_curr_tick;
+	unsigned int	m_last_update_tick;
+	unsigned int	m_last_search_tick;
+	unsigned int	m_fini_num;
+	unsigned int	m_need_ref;
+	bool		m_autoclose;
+	unsigned int	m_last_need_end_tick;
+	DLStat_t	m_stat;
+	time_t		m_last_update_pl_time;
+#ifdef SM_VOD
+	int m_playtype; //play type, 0 live, 1 vod
+	DLPlaylist_t *m_dlplaylist;
+	bool m_playlist_updatecompleted;
+	//bool m_main_download;
+#endif
+
+	// export m3u8 file to make vodpeer as a m3mu relay
+	FILE * 		m_export_logh;
+	void		export_log( const char * msg );
+	list<string>    m_timeshift_playlists;
+	string		m_playlist;
+	string		m_exportlist;
+	char * 		playlist_preprocess( const char * rsp );
+	void		export_playlist();
+
+};

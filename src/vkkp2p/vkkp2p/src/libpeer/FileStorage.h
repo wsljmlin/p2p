@@ -1,0 +1,96 @@
+#pragma once
+#include "FileInfo.h"
+
+#define MIN_SHARE_BLOCKS 20
+//typedef struct tagAutoInfo
+//{
+//	string path; //用于实时获取文件
+//	unsigned int score;
+//}AutoInfo;
+
+class FileStorage : public TimerHandler
+{
+public:
+	FileStorage(void);
+	~FileStorage(void);
+	typedef CriticalSection Mutex;
+	typedef map<hash_t,FileInfo*> FileMap;
+	typedef FileMap::iterator FileMapIter;
+public:
+	int init();
+	void fini();
+	virtual void on_timer(int e);
+private:
+	int load_downinfo();
+	int load_readyinfo();
+	void check_reload_readyinfo();
+
+	int save_downinfo();
+	int save_readyinfo();
+	int save_main_downinfo();
+	//int save_main_readyinfo();
+	void clear();
+
+	int write_downinfo_i(const FileInfo& fi);
+	int read_downinfo_i(const string& path,FileInfo& fi);
+	//int write_readyinfo_i(const FileInfo& fi);
+	//int read_readyinfo_i(const string& path,FileInfo& fi);
+public:
+
+#ifdef SM_VOD
+FileInfo* create_downinfo(const hash_t& hash,int filetype,const string& path,size64_t size=0,size64_t offset=0
+		,unsigned int block_size=DEFAULT_BLOCK_SIZE,int ftype=FTYPE_VOD,int rdbftype=RDBF_AUTO);
+FileInfo* create_readyinfo(const hash_t& hash, int filetype, const string& path,size64_t size,int ftype=FTYPE_SHAREONLY);
+int delete_fileinfo_noerase(const hash_t& hash,bool delfile);
+int delete_downinfo_noerase(const hash_t& hash,bool delfile);
+int delete_readyinfo_noerase(const hash_t& hash,bool delfile);
+
+
+#endif
+	FileInfo* create_downinfo(const hash_t& hash,const string& path,size64_t size=0,size64_t offset=0
+		,unsigned int block_size=DEFAULT_BLOCK_SIZE,int ftype=FTYPE_VOD,int rdbftype=RDBF_AUTO);
+	FileInfo* create_readyinfo(const hash_t& hash,const string& path,size64_t size,int ftype=FTYPE_SHAREONLY);
+	int update_downinfo_size(const hash_t& hash,size64_t size);
+	int update_downinfo_path(const hash_t& hash,const string& path);
+	int update_downinfo_type(const hash_t& hash,int type);
+
+	int delete_downinfo(const hash_t& hash,bool delfile);
+	int delete_readyinfo(const hash_t& hash,bool delfile);
+	int delete_fileinfo(const hash_t& hash,bool delfile);
+
+	FileInfo* get_downinfo(const hash_t& hash);
+	FileInfo* get_readyinfo(const hash_t& hash);
+	FileInfo* get_fileinfo(const hash_t& hash);
+
+	size64_t get_file_size(const hash_t& hash);
+	bool check_exist_filepath(const string& path,bool check_state);
+
+	FileBlock* get_fileblock(const hash_t& hash,unsigned int index,unsigned int index_pos,unsigned int len,unsigned int block_size);
+	FileBlock* get_fileblock_trymemcache(const hash_t& hash,unsigned int index,unsigned int index_pos,unsigned int len,unsigned int block_size);
+	void put_fileblock(FileBlock* b);
+
+	int write_filedata(const hash_t& hash,const char *buf,unsigned int buflen,unsigned int index,unsigned int indexPos);
+	void flush_file_all(FileInfo* fi);
+	int read_filedata(const hash_t& hash,char *buf,unsigned int buflen,size64_t offset);
+	int read_filedata_trymemcache(const hash_t& hash,char *buf,unsigned int buflen,size64_t offset);
+
+	int on_blockdone(const hash_t& hash,unsigned int index);
+	int on_filedone(const hash_t& hash,const hash_t& new_hash);
+
+	int read_refer(const hash_t& hash);
+	int read_release(const hash_t& hash);
+
+	int get_sharefile(const hash_t& hash,PTL_P2T_FileInfo& inf);
+	int get_sharefile_all(list<PTL_P2T_FileInfo*>& ls);
+
+private:
+	Mutex			m_mt;
+	bool			m_binit;
+	FileMap			m_downinfo,m_readyinfo;
+	int				m_readyinfo_mtime;
+	
+	string			m_downinfo_dir,m_readyinfo_dir;
+	string			m_downinfo_path,m_readyinfo_path/*,m_autoinfo_path*/;
+};
+typedef Singleton<FileStorage> FileStorageSngl;
+

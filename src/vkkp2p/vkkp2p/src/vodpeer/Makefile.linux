@@ -1,0 +1,75 @@
+#makefile:
+
+#################################
+CC := gcc
+CPP := g++
+AR := ar
+CFLAGS	= -Wall -g -DLINUX32 -D_FILE_OFFSET_BITS=64 -Werror -DNDEBUG
+
+SRCPATH = ./
+VPATH   = $(SRCPATH)
+
+
+
+LIBS    = -lpthread
+INCS    = -I$(SRCPATH)/../util -I$(SRCPATH)/../protocol -I$(SRCPATH)/../comm -I$(SRCPATH)/../peer -I$(SRCPATH)/../httpsvr
+
+##test: sources := $(shell echo *.cpp)  or sources := $(shell ls *.cpp)
+output := ../../bin/vodpeer/vodpeer.e
+sources :=  $(notdir $(wildcard $(SRCPATH)/*.cpp  $(SRCPATH)/*.c))
+
+objects := $(subst .c,.o,$(subst .cpp,.o,$(sources)))
+depends := $(subst .c,.d,$(subst .cpp,.d,$(sources)))
+archives := ../peer/libpeer.a ../util/libutil.a ../protocol/libprotocol.a ../comm/libcomm.a ../httpsvr/libhttpsvr.a
+
+################################
+all: $(output)
+
+%.o:%.c
+	$(CC) $(CFLAGS) $(INCS) -o $@ -c $<
+	
+%.o:%.cpp
+	$(CPP) $(CFLAGS) $(CPPFLAGS) $(INCS) -o $@ -c $<
+
+$(output): $(objects) $(archives)
+	$(CPP) $(LIBS) -o $@ $^
+
+	
+#################################
+#depend:
+-include $(depends)
+%.d: %.c
+	$(CC) -MM $(CFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+%.d: %.cpp
+	$(CC) -MM $(CPPFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+#################################
+.PHONY : print clean
+print:
+	echo $(sources)
+	echo $(objects)
+	echo $(depends)
+	echo $(CFLAGS)
+	echo $(CPPFLAGS)
+	(cd ../util; make print)
+	(cd ../protocol; make print)
+	(cd ../comm; make print)
+	(cd ../peer; make print)
+	(cd ../httpsvr; make print)
+	
+clean:
+	-rm *.d
+	-rm *.o
+	-rm $(output)
+	(cd ../util; make clean)
+	(cd ../protocol; make clean)
+	(cd ../comm; make clean)
+	(cd ../peer; make clean)
+	(cd ../httpsvr; make clean)
+##################################
+

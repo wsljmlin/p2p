@@ -1,0 +1,119 @@
+数据库名：vkkstat_db
+
+登录mysql: mysql -u[user] -p[password]
+查看所有数据库：show databases;      //带“；”表示结束
+使用某数据库：use [dbname];
+查看所有表：show tables;  
+查看表详细信息：desc [tablename];  //或者：describe [tablename];
+建立数据库：CREATE DATABASE `vkkstat_db`
+
+1. user表，名称：user_info
+
+CREATE TABLE `user_info` (
+  `uid` varchar(40) not NULL primary key ,
+  `first_login_time` datetime NOT NULL,
+  `last_login_time` datetime NOT NULL,
+  `last_logout_time` datetime NOT NULL,
+  `last_login_ip` varchar(16) NOT NULL,
+  `last_server_id` int(11) NOT NULL,
+  `peer_type` int(11) NOT NULL,
+  `prog_ver` varchar(50) NOT NULL,
+  `os_ver` varchar(50) NOT NULL,
+  `dump_num` int(11) NOT NULL,
+  `file_num` int(11) NOT NULL,
+  `download_flow` int(11) NOT NULL,
+  `upload_flow` int(11) NOT NULL
+) ENGINE=MyISAM DEFAULT CHARSET=utf8;
+
+CREATE INDEX index_user_info on user_info (first_login_time,last_login_time);
+
+2.tracker服务器表,名称: tracker_info
+
+CREATE TABLE `tracker_info` (
+  `id` int(11) NOT  NULL primary key,
+  `ip` varchar(16) NOT NULL,
+  `description` varchar(100) default NULL,
+  `insert_time` datetime NOT NULL
+) ENGINE=MyISAM DEFAULT CHARSET=utf8 ;
+
+3. 实时数据表,名称:real_info
+
+CREATE TABLE `real_info` (
+  `server_id` int(11) not NULL,
+  `record_time` datetime NOT NULL,
+  `online_users` int(11) NOT NULL,
+  `edge_servers` int(11) NOT NULL,
+  `center_servers` int(11) NOT NULL,
+  `super_servers` int(11) NOT NULL,
+  `online_progs` int(11) NOT NULL,
+  `online_sources` int(11) NOT NULL,
+  `nat_0` int(11) NOT NULL,
+  `nat_1` int(11) NOT NULL,
+  `nat_2` int(11) NOT NULL,
+  `nat_3` int(11) NOT NULL,
+  `nat_4` int(11) NOT NULL,
+  `nat_5` int(11) NOT NULL
+) ENGINE=MyISAM DEFAULT CHARSET=utf8 ;
+ 
+
+CREATE INDEX index_real_info on real_info (server_id,record_time);
+
+4. 数据积累统计表,名称: inc_info
+
+ CREATE TABLE `inc_info` (
+  `server_id` int(11) not NULL,
+  `record_time` datetime NOT NULL,
+  `request_files` int(11) NOT NULL,
+  `tcp_download_flow` int(11) NOT NULL,
+  `udp_download_flow` int(11) NOT NULL,
+  `http_download_flow` int(11) NOT NULL,
+  `edge_download_flow` int(11) NOT NULL,
+  `client_download_flow` int(11) NOT NULL,
+  `center_download_flow` int(11) NOT NULL,
+  `super_download_flow` int(11) NOT NULL,
+  `tcp_connect_success` int(11) NOT NULL,
+  `tcp_connect_fail` int(11) NOT NULL,
+  `tcp_accept_success` int(11) NOT NULL,
+  `tcp_accept_fail` int(11) NOT NULL,
+  `udp_connect_success` int(11) NOT NULL,
+  `udp_connect_fail` int(11) NOT NULL,
+  `udp_receive_success` int(11) NOT NULL,
+  `udp_receive_fail` int(11) NOT NULL,
+  `udp_nat_success` int(11) NOT NULL,
+  `udp_nat_fail` int(11) NOT NULL
+) ENGINE=MyISAM DEFAULT CHARSET=utf8 ;
+ 
+
+CREATE INDEX index_inc_info on inc_info (server_id,record_time);
+
+5.错误量统计表,名称: error_info
+
+ CREATE TABLE `error_info` (
+  `server_id` int(11) not NULL,
+  `record_time` datetime NOT NULL,
+  `miss_file_num` int(11) NOT NULL,
+  `only_server_num` int(11) NOT NULL,
+  `program_except_num` int(11) NOT NULL,
+  `hash_check_fail_num` int(11) NOT NULL
+) ENGINE=MyISAM DEFAULT CHARSET=utf8 ;
+
+
+CREATE INDEX index_error_info on error_info (server_id,record_time);
+
+6.速度统计图,名称:speed_info
+
+CREATE TABLE `speed_info` (
+  `server_id` int(11) not NULL,
+  `uid` varchar(40) not NULL,
+  `ip` varchar(16) not NULL,
+  `hash_type` int(4) not NULL,
+  `info_hash` varchar(50) not NULL,
+  `size` int(11) not NULL,
+  `speed` int(11) not NULL,
+  `wait_num` int(11) not NULL,
+  `download_duration` int(11) not NULL,
+  `record_time` datetime not NULL
+) ENGINE=MyISAM DEFAULT CHARSET=utf8 ;
+
+CREATE INDEX index_speed_info on speed_info (server_id,record_time);
+

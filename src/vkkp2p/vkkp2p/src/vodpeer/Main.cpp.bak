@@ -1,0 +1,550 @@
+
+#include <stdio.h>
+
+#ifdef _WIN32
+#include <crtdbg.h>
+//#ifdef NDEBUG
+//#pragma comment( linker, "/subsystem:\"windows\" /entry:\"mainCRTStartup\"" )  
+//#endif
+ 
+#else
+#include <signal.h>
+#include <unistd.h>
+#endif
+
+#include "Util.h"
+#include "MyException.h"
+
+#include "Interface.h"
+#include "HttpsvrHandler.h"
+#include "Setting.h"
+#include "DIPCache.h"
+#include "license.h"
+
+#include "Httpc.h"
+#include "md5.h"
+
+#ifdef SM_DBG
+#define SM_PRT(fmt, arg...) fprintf(stdout, "[%s:%d] "fmt, __FUNCTION__, __LINE__, ##arg)
+#else
+#define SM_PRT(fmt, arg...) 
+#endif
+
+#ifdef SM_MODIFY
+
+enum {
+	eVODPEER_RELOAD=1,
+};
+
+#endif
+
+
+
+extern bool g_is_exit;
+
+#ifndef _WIN32
+
+bool isrunning() {
+
+	FILE *fh = fopen("./peer.pid", "r");
+	if ( fh == NULL )
+		return false;
+	unsigned int pid = 0;
+	if ( fscanf(fh, "%u", &pid ) < 1 ) {
+		fclose(fh);
+		return false;
+	}
+	fclose(fh);
+	char procpid[1024];
+	sprintf(procpid, "/proc/%d/cwd/peer.pid", pid);
+
+	fh = fopen( procpid, "r" );
+	if ( fh == NULL )
+		return false;
+	unsigned int pid2 = 0;
+	fscanf(fh, "%u", &pid2 );
+	fclose(fh);
+
+	if ( pid == pid2 ) 
+		return true;
+	return false;
+}
+
+void process_status() {
+	if (  isrunning() ) {
+		printf("vodpeer is running\n");
+	} else {
+		printf("vodpeer is not running\n");
+	}
+}
+
+void process_stop() {
+	if ( ! isrunning() ) {
+		return ;
+	}
+
+	FILE *fh = fopen("./peer.pid", "r");
+	if ( fh == NULL )
+		return ;
+	unsigned int pid = 0;
+	if ( fscanf(fh, "%u", &pid ) < 1 ) {
+		fclose(fh);
+		return ;
+	}
+	fclose(fh);
+
+	kill( (pid_t)pid, SIGHUP );
+	Sleep(300);
+	kill( (pid_t)pid, SIGKILL );
+
+	unlink( "./peer.pid" );
+}
+
+
+void process_keep() {
+	if ( isrunning() ) {
+		exit(0);
+	}
+}
+
+int set_logmode( string logmode ) 
+{
+#ifdef _WIN32
+	printf("set log for windows is not supported!\n");
+#else
+	if ( logmode == "nobuf" ) {
+                static char buf[512];
+                setvbuf(stdout, buf, _IOLBF, 510 );
+                return 0;
+	}
+
+	if ( logmode == "none" ) {
+		printf("close stdout\n");
+		logmode = "file:/dev/null";
+	}
+
+	if ( logmode.find("file:") == 0 ) {
+		string logfile = logmode.substr(5);
+		printf("log file %s\n", logfile.c_str());
+
+                FILE * flog = fopen( logfile.c_str(), "w" );
+                if ( flog != NULL )
+                {
+                        close(1);
+                        dup(fileno(flog));
+                        //todo , if flog need fclose() ?
+			return 1;
+		}
+	}
+	// todo , write log to udp, android logcat ...
+	return 0;
+#endif
+}
+
+int set_daemon_mode ( int daemon_mode, int stdout_hasclosed ) 
+{
+	if ( daemon_mode == 0 )
+		return 0 ;
+#ifdef _WIN32
+	printf("set daemon for windows is not supported!\n");
+	// here should open a hide windos to run the process!
+#else
+	pid_t pid = fork();
+	if ( pid != 0 ) exit(0);
+
+	setsid();
+	close(0);
+	close(2);
+	if ( stdout_hasclosed == 0 ) close(1);
+
+	umask(0);
+#endif
+	return 1;
+}
+
+void process_start() 
+{
+	if ( isrunning() )
+		process_stop();
+	
+	string logmode = SettingSngl::instance()->get_log_mode();
+	int stdout_hasclosed = 0;
+	if ( logmode.empty() == false ) {
+		stdout_hasclosed = set_logmode( logmode );
+	}
+
+	int daemon_mode = SettingSngl::instance()->get_daemon_mode();
+	if ( daemon_mode != 0 ) {
+		set_daemon_mode( daemon_mode, stdout_hasclosed );
+	}
+
+	FILE *fh = fopen("./peer.pid", "w");
+	if ( fh == NULL ) 
+		return ;
+	fprintf(fh, "%u", getpid() );
+	fclose(fh);
+}
+
+void process_conf( const string & url, const string & rid, bool skip_err ) 
+{
+	if ( url.empty() == true ) {
+		printf("please give the zone \n");
+		if ( skip_err == false ) {
+			Sleep(3000);
+			exit(-1);
+		}
+	}
+
+	//printf("send config url %s \n", url.c_str());
+	
+	string mac_id = Util::get_mac();
+	printf("\nDEVICE ID %s\n", mac_id.c_str() );
+	if ( mac_id == "000000000000" ) {
+		printf("\nERROR: Can not get Device ID\n");
+		if ( skip_err == false ) {
+                        Sleep(3000);
+                        exit(-1);
+                }
+	}
+
+	srand((int)time(NULL));
+        int rnd = rand();
+
+        char reqstr[1000];
+        sprintf(reqstr,"tvata p2p streaming, req [%d] by (%s)",
+                rnd, mac_id.c_str() );
+        char buf2[100];
+        string macchk = md5_str_sum(reqstr, buf2, 33);
+
+        string rstr = string("tvata vodpeer") + rid;
+        string ridchk = md5_str_sum( rstr.c_str(), buf2, 33 );
+
+        char fullurl[2000];
+        sprintf( fullurl,  "%s?rid=%s&rsum=%s&uid=%s&umac=%s&rnd=%d&chk=%s",
+                        url.c_str(), rid.c_str(), ridchk.c_str(),
+                        "", mac_id.c_str(), rnd,
+                        macchk.c_str() );
+
+        //printf("send req to : %s\n", fullurl );
+ #ifdef SM_DBG	  
+	SM_PRT("send req to : %s\n", fullurl );
+#endif
+
+        char content[10240];
+        int res ;
+        for( int i = 0 ; i < 4 ; i++ ) {
+                res = Httpc::http_get(fullurl, content, 10240 );
+				
+#ifdef SM_DBG
+		SM_PRT("get response:%s\n", content);
+#endif
+
+                if ( res != -1 )
+                        break;
+                printf("request %d failed, try again!\n", i);
+                Sleep(1000);
+        }
+        if ( res == -1 ) {
+                printf("request failed!\n");
+		if ( skip_err == false ) {
+			Sleep(500);
+			exit(-1);
+		}
+		return;
+	}
+
+//#ifdef SM_DBG
+#if 0
+	FILE* fptmp = NULL;
+	fptmp = fopen("webpeerconfig.ini", "w");
+	if(!fptmp) {
+		SM_PRT("create file failed\n");
+	}
+	fwrite(content, strlen(content),1 ,fptmp);
+	fclose(fptmp);
+	SM_PRT("save file\n");
+#endif
+
+        int len = (int)strlen( content );
+        if ( len < 30 ) {
+                printf("response conf error!\n");
+		if ( skip_err == false ) {
+                        Sleep(500);
+                        exit(-1);
+                }
+                return ;
+        }
+
+	//printf("get conf :\n%s\n", content );
+	SettingSngl::instance()->load_peerconf(content);
+
+	printf("\nAUTH Code %d : %s\n", 
+			SettingSngl::instance()->get_auth_response() ,
+			SettingSngl::instance()->get_auth_message().c_str() );
+
+
+	if ( SettingSngl::instance()->get_auth_response() < 0 ) {
+		printf("\nERROR: AUTH Failed!\n");
+		Sleep(1000);
+		exit(-1);
+	}
+
+
+}
+
+#ifdef SM_MODIFY	
+int process_upgrade(int argc, char ** argv) {
+	
+	/* record version information, then version can been  seen directly */
+	string logpath =  "version.txt";
+	char buftmp[64];
+	memset(buftmp, 0, sizeof(buftmp));
+	sprintf(buftmp, "ver=%s", VERSION_STR);
+	SM_PRT("#:%s \n",buftmp);
+	SM_PRT("[++++++++++++++++update++++++++++++++]\n");
+	FILE *fp = fopen(logpath.c_str(),"w");
+	if(!fp) {
+		SM_PRT("open file failed\n");
+	}
+	fwrite(buftmp,strlen(buftmp),1,fp);
+	fclose(fp);
+
+	// update related code
+	//string exename = argv[0];
+	string exename = Util::get_module_path();
+	string updater = exename + ".updater";
+	string newfile = exename + ".newversion";
+	printf("updater: check new version %s\n", newfile.c_str() );
+	if( Util::file_exist( newfile.c_str() ) )  {
+		printf("updater: found new version %s\n", newfile.c_str() );
+		string updatecmd = updater 
+				+ " --reload \"" + newfile + "\" \"" + exename + "\" ";
+		for( int i=1; i<argc; i++ ) {
+			updatecmd += string(" \"") + string(argv[i]) + "\"";
+		}
+		printf("updater: run cmd %s\n", updatecmd.c_str() );
+		system( updatecmd.c_str() );
+		return eVODPEER_RELOAD;
+	} else {
+		printf("updater: no new version, check on network on background!\n" );
+		string updatecmd = updater
+				+ " --update \"" + newfile + "\" \"" + VERSION_STR +"\" ";
+	
+		/* get update url */
+		for( int i =0; i< argc; i++ ) {
+			 if ( strcmp( argv[i], "-zone" ) == 0 && i+1< argc ) {
+				char buf[100];
+				sprintf(buf, "%s", argv[i+1]); 
+				string url(buf);
+				int pos = (int)url.rfind('/');
+				if(pos>0)
+				url.erase(pos+1);
+				url += "update/vodpeer_update.ini";
+				updatecmd += url;
+				break;
+			}
+		}
+
+		updatecmd += " &";
+		// run on background
+
+		printf("updater: run cmd %s\n", updatecmd.c_str() );
+		system( updatecmd.c_str() );
+	}
+	
+	return 0;
+
+}
+
+#endif
+void process_args( int argc, char ** argv ) 
+{
+	string conf_url ;
+	string app_userid ;
+	bool skip_conf_err = false;
+
+	for( int i =0; i< argc; i++ ) {
+		if ( strcmp( argv[i], "-v" ) == 0 ) {
+			printf("#version: %s\n",VERSION_STR);
+			exit(0);
+		}
+		else if ( strcmp( argv[i], "-c" ) == 0 && i+1 < argc) {
+			Util::my_create_directory( argv[i+1] );
+			Util::chdir( argv[i+1] );
+			// another method is to change m_conf_path
+			// on Setting.h
+		}
+		else if ( strcmp( argv[i], "-rewriteini" ) == 0 ) {
+			SettingSngl::instance()->set_update_peerconf(1);
+		}
+		else if ( strcmp( argv[i], "-skip_conf_err" ) == 0 ) {
+			skip_conf_err = true;
+		}
+		else if ( strcmp( argv[i], "-rid" ) == 0 && i+1 < argc ) {
+			app_userid = argv[i+1];
+		}
+	}
+	// we must process "-c" to get the correctly directory 
+	// which vodpeer running
+	//
+	for( int i =0; i< argc; i++ ) {
+		if ( strcmp( argv[i], "-stop" ) == 0 ) {
+			process_stop();
+			exit(0);
+		}
+		else if ( strcmp( argv[i], "-status" ) == 0 ) {
+			process_status();
+			exit(0);
+		}
+		else if ( strcmp( argv[i], "-keep" ) == 0 ) {
+			process_keep();
+		}
+		else if ( strcmp( argv[i], "-conf_url" ) == 0 && i+1< argc ) {
+			conf_url = argv[i+1];
+		}
+		else if ( strcmp( argv[i], "-zone" ) == 0 && i+1< argc ) {
+			char buf[1000];
+#ifdef SM_MODIFY	
+			sprintf(buf, "%s", argv[i+1]);
+#else
+			sprintf(buf, "http://media.tvata.com/services2/%s/config.php", argv[i+1] );
+#endif
+			conf_url = buf;
+		}
+	}
+
+	if(!conf_url.empty())
+		process_conf( conf_url, app_userid , skip_conf_err);
+		
+	process_start();
+
+
+	printf("vodpeer begin... \n");
+}
+
+#endif
+
+int main(int argc,char** argv)
+{
+#ifdef _WIN32
+	////将进程提高到实时级
+	//if(SetPriorityClass( GetCurrentProcess(), REALTIME_PRIORITY_CLASS))
+	//{
+	//	printf("SetPriorityClass(REALTIME_PRIORITY_CLASS) ok \n");
+	//}
+#endif
+
+	Util::debug_memleak();
+	MyException::init();
+	Util::chdir(Util::get_module_dir().c_str());
+
+	/* upgrade */
+#ifdef SM_MODIFY	
+	{
+		int ret = process_upgrade(argc, argv);
+		/* need to reload */
+		if(eVODPEER_RELOAD == ret) {
+			return 0;
+		}
+	}
+#else
+	// update related code
+	//string exename = argv[0];
+	string exename = Util::get_module_path();
+	string updater = exename + ".updater";
+	string newfile = exename + ".newversion";
+	printf("updater: check new version %s\n", newfile.c_str() );
+	if( Util::file_exist( newfile.c_str() ) )  {
+		printf("updater: found new version %s\n", newfile.c_str() );
+		string updatecmd = updater 
+				+ " --reload \"" + newfile + "\" \"" + exename + "\" ";
+		for( int i=1; i<argc; i++ ) {
+			updatecmd += string(" \"") + string(argv[i]) + "\"";
+		}
+		printf("updater: run cmd %s\n", updatecmd.c_str() );
+		int r = system( updatecmd.c_str() );
+		return r;
+	} else {
+		printf("updater: no new version, check on network on background!\n" );
+		string updatecmd = updater
+				+ " --update \"" + newfile + "\" \"" + VERSION_STR +"\" ";
+	
+#ifdef _LINUX
+		updatecmd += "http://media.tvata.com/services2/update/linux.ini";
+#endif
+#ifdef _ANDROID
+		updatecmd += "http://media.tvata.com/services2/update/android.ini";
+#endif
+#ifdef _WIN32
+		updatecmd += "http://media.tvata.com/services2/update/win.ini";
+#endif
+
+		updatecmd += " &";
+		// run on background
+
+		printf("updater: run cmd %s\n", updatecmd.c_str() );
+		system( updatecmd.c_str() );
+	}
+
+	// end
+#endif
+
+#ifndef _WIN32
+	process_args( argc, argv );
+#endif
+#ifdef SM_MODIFY		
+#else
+	LicenseSngl::instance()->run();
+#endif /* end of SM_MODIFY	 */
+	PIF::instance()->load_arg(argc,argv);
+	if(0!=PIF::instance()->init())
+	{
+		PIF::instance()->fini();
+		PIF::destroy();
+		return 0;
+	}
+	httpsvr_start(SettingSngl::instance()->get_http_port());
+
+#ifndef _WIN32
+	// set firendly process name in ps command
+        if ( strlen(argv[0]) > 20 ) {
+                memcpy( argv[0], "com.tvata.vodpeer\0\0\0", 20);
+        }
+        argv[1]=NULL;
+#endif
+
+	// load hosts file
+	if (  SettingSngl::instance()->get_hosts_file().empty() == false ) {
+		DIPCache::load_hosts_file( SettingSngl::instance()->get_hosts_file() );
+	}
+	
+#ifdef _WIN32
+	char c='\0';
+	while(c!='q')
+	{
+		c = getchar(); //在无窗口运行时会占满CPU
+		Sleep(500);
+	}
+#else
+	while(!g_is_exit)
+		Sleep(3000);
+#endif
+
+
+	httpsvr_stop();
+	PIF::instance()->fini();
+	PIF::destroy();
+
+	LicenseSngl::instance()->end();
+	LicenseSngl::destroy();
+
+	printf("vodpeer end.\n");
+	return 0;
+}
+
+
+
+
+
+
+

@@ -1,0 +1,41 @@
+#pragma once
+#include "commons.h"
+
+
+class FileAutoCache
+{
+public:
+	FileAutoCache(void);
+	~FileAutoCache(void);
+
+	typedef struct tagAutoInfo
+{
+	string path; //用于实时获取文件
+	unsigned int score;
+}AutoInfo;
+
+	typedef map<hash_t,AutoInfo*> AutoMap;
+	typedef AutoMap::iterator AutoMapIter;
+
+public:
+	int init();
+	void fini();
+
+	int load_autoinfo();
+	int save_autoinfo();
+	void clear();
+
+	int add_autoinfo(const hash_t& hash,const string& path);
+	void remove_autoinfo(const hash_t& hash);
+	void on_read_refer(const hash_t& hash);
+
+	size64_t get_autocache_size();
+	bool get_autocache_map(AutoMap& mp) const { mp = m_autoinfo; return true;}
+	int auto_clear_cache(const hash_t& hashExclude); //return 0,可以继续写,1:不可以继续写
+private:
+	bool			m_binit;
+	AutoMap			m_autoinfo;
+	unsigned int	m_autoinfo_score;
+	string			m_autoinfo_path;
+};
+typedef Singleton<FileAutoCache> FileAutoCacheSngl;

@@ -1,0 +1,16 @@
+
+
+http接口:
+
+.查看程度状态
+http://127.0.0.1:7080/vttcmd/state.do
+
+
+获取所有加速列表
+http://127.0.0.1:7080/playlist/allinfo.do
+
+
+
+.获取某个直播地址的详细加速信息
+http://127.0.0.1:7080/playlist/info.do?url=playlist_url
+

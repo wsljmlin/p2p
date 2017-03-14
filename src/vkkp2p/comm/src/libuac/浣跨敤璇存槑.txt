@@ -1,0 +1,20 @@
+
+
+//*******************************************
+	UAC库所有接口均为非阻塞接口(异步模式).
+一。UAC库提供两种使用形式:
+1。 主动模式:
+	只需要使用uac.h 中的裸API接口；
+	
+2。 被动模式:
+	uac.h, uac_Socket, uac_SocketSelector.h
+	1).应用层重载UAC_SocketFactory 子类实现接收socket的处理。
+	2).循环调度UAC_SocketSelector::handle_readwrite() 处理所有UAC_Socket的读写查询
+	   循环调UAC_SocketSelector::handle_accept() 处理接收连接
+	
+//*******************************************
+二。 使用注意事项
+	1。无论哪种使用试，都必须执行UAC::init()初始化库资源,结束时UAC::fini()释放资源；
+	2。UAC只支持开一个UDP端口，在UAC::init()中指定端口。
+	3。UAC支持NAT穿透，在UAC::init()指定stun服务器，也可以不指定(UAC::init(10000,NULL,0)）
+	

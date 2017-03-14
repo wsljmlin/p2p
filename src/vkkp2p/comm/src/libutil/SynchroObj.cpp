@@ -1,0 +1,2 @@
+#include "SynchroObj.h"
+

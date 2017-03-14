@@ -1,0 +1,242 @@
+#include "PeerManager.h"
+#include "UserManager.h"
+#include "Setting.h"
+
+PeerManager::PeerManager(void)
+{
+	m_binit = false;
+	m_curr_sec = time(NULL);
+	m_last_clear_dead_sec = m_curr_sec;
+	m_max_peer_num = 0;
+	m_max_pack_num = 0;
+}
+
+PeerManager::~PeerManager(void)
+{
+}
+
+int PeerManager::init()
+{
+	if(m_binit)
+		return -1;
+	m_binit = true;
+#ifdef _WIN32
+	IOReactorSngl::instance(new SelectReactor());
+#else
+	IOReactorSngl::instance(new ProReactor(PEER_MAX_SIZE));
+#endif
+	if(0!=TCPAcceptorSngl::instance()->open(SettingSngl::instance()->get_tracker_port(),
+		SettingSngl::instance()->get_tracker_ip().c_str(),this,IOReactorSngl::instance()))
+		return -1;
+	m_peers.resize(PEER_MAX_SIZE);
+	for(int i=0;i<m_peers.size;++i)
+	{
+		m_peers[i].peer = new Peer();
+		m_peers[i].peer->add_listener(this);
+		m_peers[i].peer->set_sid(i);
+	}
+	m_packs.resize(2000);
+
+	DEBUGMSG("#-PeerManager::init \n");
+	return 0;
+}
+void PeerManager::fini()
+{
+	if(!m_binit)
+		return;
+	m_binit = false;
+	TCPAcceptorSngl::instance()->close();
+	put_all_peer();
+	
+	DEBUGMSG("#PeerManager:: %d peers clearing ...\n",m_peers.size);
+	for(int i=0;i<m_peers.size;++i)
+	{
+		m_peers[i].peer->remove_listener(this);
+		delete m_peers[i].peer;
+	}
+	m_peers.resize(0);
+	DEBUGMSG("#PeerManager:: %d peers clear end! \n",m_peers.size);
+
+	Packet pack;
+	while(m_packs.get_packet(pack))
+		pack.block->free(1);
+	m_packs.resize(0);
+	
+	TCPAcceptorSngl::destroy();
+	IOReactorSngl::destroy();
+	DEBUGMSG("-PeerManager::fini \n");
+}
+
+
+void PeerManager::handle_root()//处理收发线程
+{
+	static time_t curr_sec=0;
+	static int pack_count=0;
+	static int max_pack_count=0;
+	//DEBUGMSG("+PeerManager::handle_root() \n");
+	//io root
+	IOReactorSngl::instance()->handle_root(50);
+	
+	//send packet list
+	pack_count = m_packs.get_blocking_count();
+	if(pack_count > m_max_pack_num) 
+		m_max_pack_num = pack_count;
+	if(pack_count>=max_pack_count)
+		max_pack_count = pack_count;
+	handle_send();
+
+	//timer
+	curr_sec = time(NULL);
+	if(curr_sec != m_curr_sec)
+	{
+		m_curr_sec=curr_sec;
+		handle_timer();
+		if(max_pack_count >= 10)
+			DEBUGMSG("#...peer_count=%d : pack_count=%d...\n",m_peers.count,max_pack_count);
+		max_pack_count = 0;
+	}
+}
+void PeerManager::handle_send()
+{
+	while(m_packs.get_packet(_tmp_pack))
+	{
+		switch(_tmp_pack.cmd)
+		{
+		case PACK_CMD_DATA:
+			{
+				m_peers[_tmp_pack.sid].peer->send(_tmp_pack.block);
+				//连接已经断开时,通知上层
+			}
+			break;
+		case PACK_CMD_TCP_DISCONNECT:
+			{
+				this->put_peer(m_peers[_tmp_pack.sid].peer,false);
+			}
+			break;
+		default:
+			assert(0);
+			break;
+		}
+	}
+}
+void PeerManager::handle_timer()
+{
+	if(m_last_clear_dead_sec + 128 < m_curr_sec)
+	{
+		//每5分钟检查一次,超过两分半钟不活动的连接清掉
+		m_last_clear_dead_sec = m_curr_sec;
+		handle_dead_peer();
+		DEBUGMSG("#--------peer count = %d ---\n",m_peers.count);
+	}
+}
+void PeerManager::handle_dead_peer()
+{
+	DEBUGMSG("#--- handle_dead_peer()...\n");
+	for(int i=0;i<m_peers.size;++i)
+	{
+		if(DISCONNECTED!=m_peers[i].peer->get_channel()->get_state() && m_peers[i].last_active_time+180<m_curr_sec)
+		{
+			char buf[1024];
+			sprintf(buf,"#--- close dead peer : %s -- %d sec",Util::ip_htoas(m_peers[i].peer->get_channel()->get_hip()).c_str(),(int)(m_curr_sec-m_peers[i].last_active_time));
+			LOG_disconnect(buf);
+			DEBUGMSG("#--- close dead peer...\n");
+			put_peer(m_peers[i].peer);
+		}
+	}
+}
+
+bool PeerManager::attach_tcp_socket(SOCKET fd,sockaddr_in& addr)
+{
+	Peer *peer = get_peer();
+	if(!peer)
+		return false;
+	if(0!=peer->attach(fd,addr))
+	{
+		put_peer(peer);
+		return false;
+	}
+	return true;
+}
+Peer *PeerManager::get_peer()
+{
+	int sid = m_peers.allot();
+	if(-1==sid)
+		return NULL;
+	assert(DISCONNECTED==m_peers[sid].peer->get_channel()->get_state());
+	m_peers[sid].last_active_time = m_curr_sec;
+	if(m_peers.count > m_max_peer_num)
+		m_max_peer_num = m_peers.count;
+	return m_peers[sid].peer;
+}
+int PeerManager::put_peer(Peer *peer,bool tell/*=true*/)
+{
+	int sid = peer->get_sid();
+	assert(peer == m_peers[sid].peer);
+	m_peers[sid].peer->disconnect();
+	return 0;
+}
+void PeerManager::put_all_peer()
+{
+	for(int i=0;i<m_peers.size;++i)
+	{
+		if(m_peers.state[i])
+			put_peer(m_peers[i].peer);
+	}
+}
+
+//***************************************
+
+void PeerManager::on(PeerListener::Connected ,Peer* peer)
+{
+	m_peers[peer->get_sid()].ip = peer->get_channel()->get_hip();
+	m_peers[peer->get_sid()].port = peer->get_channel()->get_hport();
+}
+void PeerManager::on(PeerListener::Disconnected ,Peer* peer)
+{
+	int sid = peer->get_sid();
+	char buf[1024];
+	sprintf(buf,"#-- PeerManager:: on disconnect sid=%d: %s, action=%d,errno=%d ",sid,
+		Util::ip_htoas(peer->get_channel()->get_hip()).c_str(),
+		peer->get_channel()->m_last_action,peer->get_channel()->m_last_error);
+	LOG_disconnect(buf);
+
+	m_peers.free(sid);
+	//目前只要断开都发一条信息
+	Packet inf;
+	inf.sid = sid;
+	inf.block = NULL;
+	inf.cmd = PACK_CMD_TCP_DISCONNECT;
+	UserManagerSngl::instance()->put_packet(inf);
+}
+void PeerManager::on(PeerListener::Data ,Peer* peer,MemBlock *block)
+{
+	//注意：block已经为一个游离块，所以投到某地方处理失败时，记得要put回块池
+	m_peers[peer->get_sid()].last_active_time = m_curr_sec;
+	_tmp_pack.block = block;
+	_tmp_pack.cmd   = 0;
+	_tmp_pack.sid   = peer->get_sid();
+	_tmp_pack.ip    = m_peers[_tmp_pack.sid].ip;
+	_tmp_pack.port  = m_peers[_tmp_pack.sid].port;
+/*
+	PTLStream ss;
+	PTL_Head  head;
+	ss.attach(_tmp_pack.block->buf,_tmp_pack.block->datalen,_tmp_pack.block->datalen);
+	//if(0!=(ss>>head))
+	//break;
+	printf("++++++++++++++++++++++\n");
+	if(PTL_P2T_REPORT_SHARE_FILE==head.cmd) {
+		PTL_P2T_ReportShareFile           report_sharefile;
+		ss>>report_sharefile;
+		printf("++++++++++++++playtype=%d\n", report_sharefile.filetype);
+	} */
+	
+	
+	if(!UserManagerSngl::instance()->put_packet(_tmp_pack))
+	{
+		block->free(1);
+		//此时队列拥塞，考虑断开连接，并通知用户下线,但实际上因为队列满却又无法再发命令过去
+		DEBUGMSG("***** cmd queue blocking...\n");
+	}
+}
+
+

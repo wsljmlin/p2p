@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="gbk" standalone="yes"?>
+<dcc_config>
+  <http_port>8080</http_port>
+  <devices>
+    <serialport>
+      <!-- 配置说明: -->
+		  <!-- StopBits=0表示1位；=1表示1.5位；=2表示2位；-->
+		  <!-- coder:，不指字时原串发送/接收；"hex"时每个发送字符用该字符的ASCII值通过两个16进制显示字符表示 -->
+      <!-- send:发送字符串中有","分隔表示分多次发送,发送间隔值为send_delay_ms (毫秒)-->
+      <!-- send_delay_ms：如果命令分多次发送，此值表示每两个发送动作之间的间隔-->
+      <!-- recv_maxnum: 尝试接收最大字节数，默认为0或空时，自动计算接收数 -->
+      <!-- recv: 校验返回的正确结果的描述: 多个结果校验用"#"或","分隔."#"表示并且，","表示或者. -->
+		  <device path="COM1" BaudRate="9600" ByteSize="8" StopBits="0" Parity="0" to_RInterval="300" to_RTMultiplier="20" to_RTConstant="500" to_WTMultiplier="20" to_WTConstant="500"> 
+			  <cmd id="1" description="open" coder="hex" send="01DC10E8,13E0F" send_delay_ms="200" recv_maxnum="0" recv="0102:#020:1=2,02034" err_jump_id="2"/>
+        <cmd id="2" description="close" coder="" send="ppopendd" send_delay_ms="200" recv_maxnum="0" recv="pp12345dd" err_jump_id=""/>
+      </device>
+      <device path="COM2" BaudRate="9600" ByteSize="8" StopBits="0" Parity="0">
+        <cmd id="2" description="close" coder="" send="ppopendd" send_delay_ms="200" recv_maxnum="0" recv="pp12345dd" err_jump_id=""/>
+		  </device>
+	  </serialport>
+  </devices>
+	<calls>
+    <call id="1">
+      <device type="serialport" path="COM1" cmd_ids="1"/>
+    </call>
+    <call id="2">
+      <device type="serialport" path="COM1" cmd_ids="2"/>
+    </call>
+  </calls>
+</dcc_config>
+

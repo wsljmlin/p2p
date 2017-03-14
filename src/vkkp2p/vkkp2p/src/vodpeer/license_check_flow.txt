@@ -1,0 +1,12 @@
+
+new license check flow .
+
+1. get token from server, toke may different in different time and different client.
+
+2. send chk request with random , and checksum for random by token , and license type
+   and mac/device id
+
+3.  server response checksum for license key ( get from license type ) , random, license
+   type. ( now mac / device id not include for checksum )
+
+4.  client verify checksum for valid license.

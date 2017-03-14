@@ -1,0 +1,250 @@
+#include "FileAutoCache.h"
+#include "Setting.h"
+#include "Util.h"
+#include "FileStorage.h"
+#include "DownloadManager.h"
+
+#ifdef SM_DBG
+#define FILEAUTOCACHE_PRT(fmt, arg...) fprintf(stdout, "[%s(%s):%d] "fmt, __FUNCTION__, "FileAutoCache",__LINE__, ##arg)
+#else
+#define FILEAUTOCACHE_PRT(fmt, arg...)
+#endif
+
+
+
+FileAutoCache::FileAutoCache(void)
+: m_binit(false)
+, m_autoinfo_score(0)
+{
+}
+
+FileAutoCache::~FileAutoCache(void)
+{
+}
+
+int FileAutoCache::init()
+{
+	if(m_binit)
+		return 0;
+	m_binit = true;
+	m_autoinfo_path = SettingSngl::instance()->get_data_path() + "autoinfo.dat";
+	load_autoinfo();
+	save_autoinfo();
+	return 0;
+}
+void FileAutoCache::fini()
+{
+	if(!m_binit)
+		return;
+	m_binit = false;
+	save_autoinfo();
+	clear();
+}
+
+int FileAutoCache::load_autoinfo()
+{
+	if(SettingSngl::instance()->get_is_minor_version())
+		return -1;
+	FILE *fp = fopen(m_autoinfo_path.c_str(),"rb");
+	if(NULL == fp)
+		return -1;
+	uchar buf[64];
+	char pathbuf[256];
+	memset(buf,0,64);
+	fread(buf,4,1,fp);
+	if(0!=memcmp(buf,"ATIF",4))
+	{
+		fclose(fp);
+		return -1;
+	}
+	//只支持版本1
+	int ver = 0;
+	fread(&ver,4,1,fp);
+	if(1!=ver)
+	{
+		fclose(fp);
+		return -1;
+	}
+	hash_t hash;
+	AutoInfo *inf;
+	unsigned int score = 0;
+	unsigned int min_score = 10000;
+	unsigned int max_score = 0;
+	while(!feof(fp))
+	{
+		if(1!=fread(buf,HASHLEN,1,fp)) 
+			break;
+		hash.set_buffer(buf);
+		fread(&score,4,1,fp);
+		memset(pathbuf,0,256);
+		fread(pathbuf,256,1,fp);
+
+		if(!FileStorageSngl::instance()->get_fileinfo(hash))
+			continue;
+		if (min_score > score)
+			min_score = score;
+		if (max_score < score)
+			max_score =score;
+		inf = new AutoInfo();
+		if(inf)
+		{
+			inf->path = pathbuf;
+			inf->score = score;
+			m_autoinfo[hash] = inf;
+		}
+	}
+	fclose(fp);
+	if(10000 == min_score)
+		min_score = 0;
+	if(min_score>0)
+	{
+		for(AutoMapIter it=m_autoinfo.begin();it!=m_autoinfo.end();++it)
+			it->second->score -= min_score;
+		max_score -= min_score;
+	}
+	m_autoinfo_score = max_score;
+	return 0;
+}
+int FileAutoCache::save_autoinfo()
+{
+	if(SettingSngl::instance()->get_is_minor_version())
+		return -1;
+	FILE *fp = fopen(m_autoinfo_path.c_str(),"wb+");
+	if(NULL == fp)
+		return -1;
+	list<string> ls;
+	char buf[256];
+	char tth[45];
+	memset(tth,0,45);
+	fwrite("ATIF",4,1,fp);
+	int ver = 1;
+	fwrite(&ver,4,1,fp);
+	for(AutoMapIter it=m_autoinfo.begin();it!=m_autoinfo.end();++it)
+	{
+		fwrite(it->first.buffer(),HASHLEN,1,fp);
+		fwrite(&it->second->score,4,1,fp);
+		strcpy(buf,it->second->path.c_str());
+		fwrite(buf,256,1,fp);
+
+		it->first.to_string(tth,45);
+		sprintf(buf,"%s|%s|%d",tth,it->second->path.c_str(),it->second->score);
+		ls.push_back(buf);
+	}
+	fclose(fp);
+	//同时保存一份简单文本供阅读
+	Util::put_stringlist_to_file(m_autoinfo_path+".txt",ls);
+	return 0;
+}
+void FileAutoCache::clear()
+{
+	for(AutoMapIter it2=m_autoinfo.begin();it2!=m_autoinfo.end();++it2)
+		delete it2->second;
+	m_autoinfo.clear();
+}
+int FileAutoCache::add_autoinfo(const hash_t& hash,const string& path)
+{
+	//如果存在，替换路径
+	AutoMapIter it = m_autoinfo.find(hash);
+	if(it!=m_autoinfo.end())
+	{
+		it->second->path = path;
+		save_autoinfo();
+		return 0;
+	}
+	AutoInfo *inf = new AutoInfo();
+	inf->path = path;
+	inf->score = m_autoinfo_score;//ready refer的时候递增
+	m_autoinfo[hash] = inf; 
+	save_autoinfo();
+	return 0;
+}
+void FileAutoCache::remove_autoinfo(const hash_t& hash)
+{
+	AutoMapIter it = m_autoinfo.find(hash);
+	if(it!=m_autoinfo.end())
+	{
+		delete it->second;
+		m_autoinfo.erase(it);
+		save_autoinfo();
+	}
+}
+void FileAutoCache::on_read_refer(const hash_t& hash)
+{
+	AutoMapIter it=m_autoinfo.find(hash);
+	if(it!=m_autoinfo.end())
+		it->second->score = ++m_autoinfo_score;
+	save_autoinfo();
+}
+
+size64_t FileAutoCache::get_autocache_size()
+{
+	size64_t size = 0,itmp=0;
+	for(AutoMapIter it=m_autoinfo.begin();it!=m_autoinfo.end(); ++it)
+	{
+		itmp = File64::get_file_size(it->second->path.c_str());
+		//只cache内存的时候不会有大小
+		if(itmp>0) 
+			size += itmp;
+	}
+	return size;
+}
+int FileAutoCache::auto_clear_cache(const hash_t& hashExclude)
+{
+	ULONGLONG total=0,used=0,free=0,minFree=0;
+	Util::get_volume_size(SettingSngl::instance()->get_cache_path(),total,used,free);
+	minFree = SettingSngl::instance()->get_disk_min_free_spaceMB();
+	minFree = minFree << 20; //默认最少保证该盘1G的空间
+	uint64 cacheSize = get_autocache_size();
+	uint64 maxSize = SettingSngl::instance()->get_cache_sizeMB();
+	maxSize = maxSize << 20;
+	uint64 sizetmp=0, sizetmp2=0;
+	int ret = 0;
+	if(cacheSize > maxSize || (cacheSize>0 && total!=0 && free<minFree))
+	{
+		ret = 1;  //不可以继续写
+		AutoMap mp;
+		AutoMapIter it,min_it;
+		get_autocache_map(mp);
+
+		unsigned int minScore = 10000;
+		bool isFind = false;
+		hash_t hash;
+		FileInfo *fi=NULL;
+		////每次删除留400M空间或者1/8 中的大者
+		//sizetmp = maxSize/8;  //
+		//if( sizetmp< (400<<20) ) 
+		sizetmp = 400<<20;
+		while((cacheSize + sizetmp) > maxSize || (total!=0 && free<minFree))
+		{
+			isFind = false;
+			minScore = 10000;
+			for(it=mp.begin();it!=mp.end();++it)
+			{
+				if(it->first == hashExclude)
+					continue;
+				if(minScore>it->second->score)
+				{
+					minScore = it->second->score;
+					min_it = it;
+					isFind = true;
+				}
+			}
+			if(!isFind)
+				break;
+			hash = min_it->first;
+			mp.erase(min_it);
+			fi = FileStorageSngl::instance()->get_fileinfo(hash);
+			if(!fi || fi->ref)
+				continue;
+			sizetmp2 = File64::get_file_size(fi->path.c_str());
+			cacheSize -= sizetmp2;
+			DownloadManagerSngl::instance()->delete_file(hash,true);
+			//异步删除不能实时取
+			//Util::get_volume_size(SettingSngl::instance()->get_cache_path(),total,used,free);
+			if(total!=0) free+=sizetmp2;
+			ret = 0;  //可以继续写
+		}
+	}
+	return ret;
+}
+

@@ -1,0 +1,91 @@
+#makefile:
+
+#################################
+#NDK_DIR := /data/android/android-ndk-r4b
+NDK_DIR := /opt/andr/android-ndk-r6b
+NDK_HOST := linux-x86
+#SDKTOOL := /data/android/android-sdk-linux_x86/tools
+TOOLCHAIN_PREFIX := $(NDK_DIR)/toolchains/arm-linux-androideabi-4.4.3/prebuilt/$(NDK_HOST)/bin/arm-linux-androideabi-
+
+CC := $(TOOLCHAIN_PREFIX)gcc
+CPP:= $(TOOLCHAIN_PREFIX)g++
+AR := $(TOOLCHAIN_PREFIX)ar
+LD := $(CPP)
+
+COMMON_FLAGS := -mandroid -ffunction-sections -fdata-sections -Os -g \
+	--sysroot=$(NDK_DIR)/platforms/android-9/arch-arm \
+	-fPIC \
+	-fvisibility=hidden \
+	-D__NEW__
+
+CFLAGS := $(COMMON_FLAGS)
+CFLAGS += -D__ARM_ARCH_9__ -D__ARM_ARCH_9T__ -D__ARM_ARCH_9E__ -D__ARM_ARCH_9TE__ -DANDROID -DSK_RELEASE -DNDEBUG
+CFLAGS += -UDEBUG -march=armv9te -mtune=xscale -msoft-float -mthumb-interwork -fpic -ffunction-sections -funwind-tables \
+	-fstack-protector -fmessage-length=0 -Bdynamic
+CFLAGS	= -Wall -g -DLINUX32 -D_FILE_OFFSET_BITS=64 -Werror -DNDEBUG
+
+##########
+###-fno-rtti 不支持“运行时类型信息”(Runtime Type Information)
+CPPFLAGS := $(COMMON_FLAGS) \
+	-fno-rtti -fno-exceptions -fno-strict-aliasing \
+	-fvisibility-inlines-hidden 
+
+LDFLAGS += --sysroot=$(NDK_DIR)/platforms/android-9/arch-arm 
+LDFLAGS +=  -Bdynamic -Wl,-dynamic-linker,/system/bin/linker -Wl,--gc-sections -Wl,-z,nocopyreloc   
+LDFLAGS += -L$(NDK_DIR)/toolchains/arm-linux-androideabi-4.4.3/prebuilt/$(NDK_HOST)/lib/gcc/arm-linux-androideabi/4.4.3
+LDFLAGS += -L$(NDK_DIR)/toolchains/arm-linux-androideabi-4.4.3/prebuilt/$(NDK_HOST)/lib/gcc
+LDFLAGS += -L$(NDK_DIR)/toolchains/arm-linux-androideabi-4.4.3/prebuilt/$(NDK_HOST)/lib
+LDFLAGS += -nostdlib -lc -llog -lgcc \
+		       --no-undefined -z $(NDK_DIR)/platforms/android-9/arch-arm/usr/lib/crtbegin_dynamic.o \
+			       $(NDK_DIR)/platforms/android-9/arch-arm/usr/lib/crtend_android.o
+
+LIBS    = -lpthread
+INCS    = -I../util -I../protocol -I../comm
+
+##test: sources := $(shell echo *.cpp)  or sources := $(shell ls *.cpp)
+output := libpeer_andr-r6.a
+sources :=  $(wildcard *.cpp *.c)
+objects := $(subst .c,.o,$(subst .cpp,.o,$(sources)))
+depends := $(subst .c,.d,$(subst .cpp,.d,$(sources)))
+archives :=
+
+################################
+all: $(output)
+
+%.o:%.c
+	$(CC) $(CFLAGS) $(INCS) -o $@ -c $<
+	
+%.o:%.cpp
+	$(CPP) $(CFLAGS) $(CPPFLAGS) $(INCS) -o $@ -c $<
+
+$(output): $(objects) $(archives)
+	$(AR) rv $@ $^
+	
+#################################
+#depend:
+-include $(depends)
+%.d: %.c
+	$(CC) -MM $(CFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+%.d: %.cpp
+	$(CC) -MM $(CPPFLAGS) $< > $@.$$$$;                   \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@;   \
+	rm -f $@.$$$$
+	
+#################################
+.PHONY : print clean
+print:
+	echo $(sources)
+	echo $(objects)
+	echo $(depends)
+	echo $(CFLAGS)
+	echo $(CPPFLAGS)
+	
+clean:
+	-rm *.d
+	-rm *.o
+	-rm $(output)
+##################################
+

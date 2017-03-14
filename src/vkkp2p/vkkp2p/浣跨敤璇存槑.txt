@@ -1,0 +1,10 @@
+
+1. windows 版本
+    进行vkkp2p目录打开vkkp2p.sln即可
+
+2. linux版本编译,进入vkkp2p/linux/vodpeer 编译vodpeer
+
+3. android版本编译,进入vkkp2p/android/vodpeer 编译vodpeer
+
+4. os x 版本编译,进入vkkp2p/os/vodpeer 编译vodpeer
+

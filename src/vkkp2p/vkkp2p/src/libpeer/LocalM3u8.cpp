@@ -1,0 +1,218 @@
+#include "LocalM3u8.h"
+#include "Tracker.h"
+#include "FileStorage.h"
+#include "Util.h"
+#include "Setting.h"
+
+LocalM3u8::LocalM3u8(void)
+{
+}
+
+LocalM3u8::~LocalM3u8(void)
+{
+}
+
+LocalM3u8* LocalM3u8::open(const string& url,const string& path)
+{
+	string rootdir,preurl;
+	if(url.empty() || path.empty())
+		return NULL;
+	int pos1 = (int)path.rfind('/');
+	int pos2 = (int)path.rfind('\\');
+	if(pos1 < pos2) pos1 = pos2;
+	if(pos1 < 0)
+		rootdir = "./";
+	else
+		rootdir = path.substr(0,pos1+1);
+	pos1 = (int)url.rfind('/');
+	if(pos1>0)
+		preurl = url.substr(0,pos1+1);
+	else
+		return NULL;
+
+	LocalM3u8 * lm = new LocalM3u8();
+	lm->m_url = url;
+	lm->m_path = path;
+	lm->m_hash.set_urldl_string(url.c_str());
+	lm->m_preurl = preurl;
+	lm->m_rootdir = rootdir;
+	lm->m_path_errlog = path;
+	lm->m_path_errlog += ".err.log";
+	lm->m_path_bak = path ;
+	lm->m_path_bak += ".bak.txt";
+
+	lm->p2p_share();
+	return lm;
+}
+void LocalM3u8::close()
+{
+#ifdef SM_VOD
+	TrackerSngl::instance()->PTL_ReportRemoveFile(m_hash,FileStorageSngl::instance()->get_fileinfo(m_hash)->filetype);
+#else
+	TrackerSngl::instance()->PTL_ReportRemoveFile(m_hash);
+#endif /* end of SM_VOD */
+	for(list<FileInfo_t>::iterator it=m_file_list.begin();it!=m_file_list.end();++it)
+	{
+		FileStorageSngl::instance()->delete_readyinfo((*it).hash,false);
+	}
+	m_file_list.clear();
+	delete this;
+}
+int LocalM3u8::p2p_share()
+{
+#ifdef SM_VOD
+	return TrackerSngl::instance()->PTL_ReportShareFile(m_hash,0,FileStorageSngl::instance()->get_fileinfo(m_hash)->filetype);
+#else
+	return TrackerSngl::instance()->PTL_ReportShareFile(m_hash,0);
+#endif /* end of SM_VOD */
+}
+int LocalM3u8::update()
+{
+	list<string> ls;
+	Util::get_stringlist_from_file(m_path,ls);
+
+	list<string>::iterator strit;
+	list<FileInfo_t>::iterator fiit;
+	char buf[2048];
+	string str;
+	bool bfind;
+	int i=0;
+	
+	//1。清理过时片段
+	for(fiit=m_file_list.begin();fiit!=m_file_list.end();)
+	{
+		bfind = false;
+		for(strit = ls.begin();strit!=ls.end();)
+		{
+			str = *strit;
+			if(str.empty() || str.at(0)=='#')
+			{
+				ls.erase(strit++);
+				continue;
+			}
+			if(str.find("http://")==0)
+			{
+				sprintf(buf,"#*** LocalM3u8::update() -- FUE (%s)",str.c_str());
+				Util::write_log(buf,m_path_errlog.c_str());
+				ls.erase(strit++);
+				continue;
+			}
+			if((*fiit).path == str)
+			{
+				bfind = true;
+				ls.erase(strit);
+				break;
+			}
+			strit++;
+		}
+		if(!bfind)
+		{
+			FileStorageSngl::instance()->delete_readyinfo((*fiit).hash,false);
+			m_file_list.erase(fiit++);
+			i++;
+		}
+		else
+		{
+			fiit++;
+		}
+	}
+
+	//将新文件共享
+	FileInfo_t fi;
+	string fullpath,fullurl;
+	for(strit = ls.begin();strit!=ls.end();++strit)
+	{
+		str = *strit;
+		if(str.empty() || str.at(0) == '#')
+			continue;
+		fi.path = str;
+
+		if(str.substr(0,2)=="./")
+			str.erase(0,2);
+		fullpath = m_rootdir + str;
+		fullurl = m_preurl + str;
+		if(!Util::file_exist(fullpath))
+		{
+			sprintf(buf,"#*** LocalM3u8::update() -- FPE (%s)",fullpath.c_str());
+			Util::write_log(buf,m_path_errlog.c_str());
+			continue;
+		}
+		fi.hash.set_url2_string(m_url.c_str(),fullurl.c_str()); //跟DownloadList的格式一致
+		if(FileStorageSngl::instance()->create_readyinfo(fi.hash,fullpath,0))
+		{
+			m_file_list.push_back(fi);
+			i++;
+		}
+		else
+		{
+			sprintf(buf,"#*** LocalM3u8::update() -- FSE (%s)",fullpath.c_str());
+			Util::write_log(buf,m_path_errlog.c_str());
+		}
+	}
+	if(i>0)
+	{
+		ls.clear();
+		char hashbuf[64];
+		for(fiit=m_file_list.begin();fiit!=m_file_list.end();++fiit)
+		{
+			(*fiit).hash.to_string(hashbuf,64);
+			sprintf(buf,"%s|%s",(*fiit).path.c_str(),hashbuf);
+			ls.push_back(buf);
+		}
+		Util::put_stringlist_to_file(m_path_bak,ls);
+	}
+	return 0;
+}
+
+//***************************************************************************
+
+LocalM3u8Mgr::LocalM3u8Mgr(void)
+{
+}
+LocalM3u8Mgr::~LocalM3u8Mgr(void)
+{
+}
+
+int LocalM3u8Mgr::init()
+{
+	list<string> ls;
+	string str,url,path;
+	LocalM3u8 *plm=NULL;
+	Util::get_stringlist_from_file(SettingSngl::instance()->get_path_localm3u8(),ls);
+	for(list<string>::iterator it=ls.begin();it!=ls.end();++it)
+	{
+		str = *it;
+		url = Util::get_string_index(str,0,"|");
+		path = Util::get_string_index(str,1,"|");
+		plm = LocalM3u8::open(url,path);
+		if(plm)
+			m_lms.push_back(plm);
+	}
+	if(!m_lms.empty())
+		TimerSngl::instance()->register_timer(this,1,3000);
+	return 0;
+}
+void LocalM3u8Mgr::fini()
+{
+	TimerSngl::instance()->unregister_all(this);
+	for(list<LocalM3u8*>::iterator it=m_lms.begin();it!=m_lms.end();++it)
+	{
+		(*it)->close();
+	}
+	m_lms.clear();
+}
+void LocalM3u8Mgr::on_timer(int e)
+{
+	for(list<LocalM3u8*>::iterator it=m_lms.begin();it!=m_lms.end();++it)
+	{
+		(*it)->update();
+	}
+}
+void LocalM3u8Mgr::on_tracker_connected()
+{
+	for(list<LocalM3u8*>::iterator it=m_lms.begin();it!=m_lms.end();++it)
+	{
+		(*it)->p2p_share();
+	}
+}
+

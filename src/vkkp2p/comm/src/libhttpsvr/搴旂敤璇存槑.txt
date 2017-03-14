@@ -1,0 +1,10 @@
+
+https：
+	－－－简单http server 服务器 ; windows/linux lib 静态库
+	
+功能：
+主要用于实现本地http服务器http接口访问功能。
+
+依赖：
+util.lib
+

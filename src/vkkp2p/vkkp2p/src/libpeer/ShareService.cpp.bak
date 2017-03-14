@@ -1,0 +1,416 @@
+#include "ShareService.h"
+#include "Timer.h"
+#include "Setting.h"
+#include "Statistician.h"
+#include "DownloadListManager.h"
+
+#define GET_SHARE_PEERDATA_RETURN(_name,_peer,_ret) \
+	PeerData* _name = GetPeerData(_peer); \
+	if(NULL==_name) return _ret;
+
+ShareService::ShareService(void)
+: m_iCurrTick(0)
+{
+}
+
+ShareService::~ShareService(void)
+{
+}
+
+int ShareService::init()
+{
+	TimerSngl::instance()->register_timer(this,1,1000);
+	return 0;
+}
+int ShareService::fini()
+{
+	TimerSngl::instance()->unregister_all(this);
+	PutAllPeer();
+	m_sendingPeers.clear();
+	return 0;
+}
+
+#define CASE_CMD_DO(cmd,func) case cmd:func(peer,ss);break;
+int ShareService::on_ptl_packet(Peer* peer,uint16 cmd,PTLStream& ss)
+{
+	switch(cmd)
+	{
+		CASE_CMD_DO(PTL_P2P_REQUEST_FILE_BLOCK_TABLE,ON_PTL_RequestFileBlockTable)
+		CASE_CMD_DO(PTL_P2P_REQUEST_FILE_BLOCKS,ON_PTL_RequestFileBlocks)
+		CASE_CMD_DO(PTL_P2P_CANCEL_FILE_BLOCKS,ON_PTL_CancelFileBlocks)
+		CASE_CMD_DO(PTL_P2P_REQUEST_FILE_SUB_KEYS,ON_PTL_RequestFileSubKeys)
+	default:
+		assert(0);
+		break;
+	}
+	return 0;
+}
+
+int ShareService::peer_attach(Peer* peer)
+{
+	if(!(SettingSngl::instance()->get_menu() & MENU_SHARE) || m_peers.size() >= (size_t)SettingSngl::instance()->get_share_cnns())
+	{
+		PeerManagerSngl::instance()->check_put_peer(peer);
+		return -1;
+	}
+	PeerData *data = new PeerData();
+	if(!data)
+	{
+		PeerManagerSngl::instance()->check_put_peer(peer);
+		return -1;
+	}
+	data->iPeerBeginTick = m_iCurrTick;
+	m_peers[peer] = data;
+	PeerManagerSngl::instance()->add_share(peer);
+	if(1==m_peers.size() && SettingSngl::instance()->get_share_speed())
+		TimerSngl::instance()->register_timer(this,2,50);
+	StatisticianSngl::instance()->OnShareStart();
+	return 0;
+}
+
+void ShareService::peer_detach(Peer* peer)
+{
+	PeerMapIter it = m_peers.find(peer);
+	if (it != m_peers.end())
+	{
+		PeerData *data = it->second;
+		//速度日志
+		int tick = m_iCurrTick - data->iPeerBeginTick;
+		if(tick > 10)
+		{
+			int speed = (int)(data->iPeerShareBytes/tick);
+			StatisticianSngl::instance()->OnConnectionSpeed(peer->get_channel()->get_hip(),speed,tick,peer->get_ip_type(),peer->get_user_type(),false);
+		}
+		if(data->fb)
+		{
+			FileStorageSngl::instance()->put_fileblock(data->fb);
+			data->fb = NULL;
+		}
+		delete data;
+		m_peers.erase(it);
+	}
+	else
+	{
+		assert(0);
+		return;
+	}
+	PeerManagerSngl::instance()->del_share(peer);
+	if(m_peers.empty() && SettingSngl::instance()->get_share_speed())
+		TimerSngl::instance()->unregister_timer(this,2);
+	StatisticianSngl::instance()->OnShareStop();
+}
+
+void ShareService::on_writable(Peer* peer)
+{
+	if(0==StatisticianSngl::instance()->GetMaxSendAllow() || !m_sendingPeers.empty())
+	{
+		PeerData* data = this->GetPeerData(peer);
+		if(data && 0==data->pause_send)
+		{
+			m_sendingPeers.push_back(peer);
+			data->pause_send = 1;
+		}
+	}
+	else
+		SendBlockData(peer);
+}
+void ShareService::on_timer(int e)
+{
+	switch(e)
+	{
+	case 1:
+		{
+			m_iCurrTick++;
+		}
+		break;
+	case 2:
+		{
+			//限速发送
+			while(!m_sendingPeers.empty())
+			{
+				if(0==StatisticianSngl::instance()->GetMaxSendAllow())
+					break;
+				Peer *peer = m_sendingPeers.front();
+				m_sendingPeers.pop_front();
+				SendBlockData(peer);
+			}
+		}
+		break;
+	default:
+		assert(0);
+		break;
+	}
+}
+
+void ShareService::PutAllPeer()
+{
+	while(m_peers.size())
+		peer_detach(m_peers.begin()->first);
+}
+int ShareService::SendBlockData(Peer* peer)
+{
+	//DEBUGMSG("SendBlockData() \n");
+	GET_SHARE_PEERDATA_RETURN(data,peer,-1)
+	data->pause_send = 0;
+	if(data->blockList.empty())
+		return -1;
+
+	if(!data->fb || data->blockList.front().hash != data->hash || data->blockList.front().index != data->iCurrIndex)
+	{
+		//总是保证队列首block为当前回复block
+		if (data->fb)
+		{
+			FileStorageSngl::instance()->put_fileblock(data->fb);
+			data->fb = NULL;
+		}
+		while(!data->blockList.empty())
+		{
+			BlockInfo& bi = data->blockList.front();
+			data->fb = FileStorageSngl::instance()->get_fileblock_trymemcache(bi.hash,bi.index,bi.pos,
+				bi.blockSize-bi.pos,bi.fileBlockSize);
+			if(!data->fb)
+			{
+				hash_t hash = bi.hash;
+				int index = bi.index;
+				data->blockList.pop_front();
+				PTL_CancelBlock(peer,hash,index);
+			}
+			else
+			{
+				data->hash = bi.hash;
+				data->iCurrIndex = bi.index;
+				break;
+			}
+		}
+	}
+	if(data->blockList.empty())
+		return -1;
+
+	BlockInfo& bi = data->blockList.front();
+	assert(bi.blockSize>bi.pos);
+	assert(data->hash == bi.hash && data->iCurrIndex == bi.index);
+
+#define PACKET_LEN 6*1024
+	unsigned int len =PACKET_LEN;//todo:根据限速发送数据,如果本次不发送数据,UDP/TCP不会再次on_send,少发数据会影响UDP传输效率
+	if(len >(bi.blockSize - bi.pos))
+		len = bi.blockSize - bi.pos;
+	StatisticianSngl::instance()->OnShareBytes(len,peer->get_ip_type());
+	if(HT_URL2==data->hash.hash_type())
+		DownloadListManagerSngl::instance()->on_share_bytes(data->hash,len,peer->get_ip_type());
+	data->iPeerShareBytes += len;
+
+	PTL_P2P_ResponseFileBlocksData rsp;
+	rsp.blockIndex = bi.index;
+	memcpy(rsp.fhash,bi.hash.buffer(),HASHLEN);
+	rsp.offset = bi.pos;
+	rsp.size = len;
+	rsp.blockSize = bi.fileBlockSize;
+	rsp.data = data->fb->buf+bi.pos;
+	int ret = SendPTLPacket(PTL_P2P_RESPONSE_FILE_BLOCKS_DATA,rsp,peer,PACKET_LEN+200);
+	if(-1!=ret)
+	{
+		bi.pos += len;
+		if(bi.pos >= bi.blockSize)
+		{
+			FileStorageSngl::instance()->put_fileblock(data->fb);
+			data->fb = NULL;
+			data->iCurrIndex = 0;
+			data->blockList.pop_front();
+		}
+		if(0==ret)
+		{
+			//还可以继续发送数据，直到为1
+			on_writable(peer);
+		}
+	}
+	return 0;
+}
+ShareService::PeerData *ShareService::GetPeerData(Peer* peer)
+{
+	PeerMapIter it=m_peers.find(peer);
+	if(it!=m_peers.end())
+		return it->second;
+	return NULL;
+}
+int ShareService::PTL_CancelBlock(Peer* peer,const hash_t& hash,int index)
+{
+	//用回复FileBlocks 代替CancelBlocks
+	PTL_P2P_ResponseFileBlocks rsp;
+	rsp.blockSize = 0;
+	memcpy(rsp.fhash,hash.buffer(),HASHLEN);
+	rsp.num = 1;
+	rsp.indexs[0] = index;
+	rsp.blockState[0] = 0;
+	return SendPTLPacket(PTL_P2P_RESPONSE_FILE_BLOCKS,rsp,peer,1024);
+}
+
+int ShareService::ON_PTL_RequestFileBlockTable(Peer* peer,PTLStream& ss)
+{
+	PTL_P2P_RequestFileBlockTable req;
+	if(0!=(ss >> req))
+	{
+		assert(0);
+		return -1;
+	}
+	//GET_SHARE_PEERDATA_RETURN(data,peer,-1)
+	_hash.set_buffer((uchar*)req.fhash);
+	FileInfo* fi =  FileStorageSngl::instance()->get_readyinfo(_hash);
+	bool isReady = true;
+	if (fi == NULL)
+	{
+		fi = FileStorageSngl::instance()->get_downinfo(_hash);
+		isReady = false;
+	}
+
+	PTL_P2P_ResponseFileBlockTable rsp;
+	memset(&rsp,0,sizeof(rsp));
+	memcpy(rsp.fhash,req.fhash,HASHLEN);
+	if (fi && fi->block_size == req.blockSize )
+	{
+		//暂时不处理不同块问题
+		rsp.blockSize = fi->block_size;
+		rsp.fsize = fi->size;
+		rsp.startBufI = req.startBufI;
+		if(!isReady)
+		{
+			rsp.result = 0;
+			if(req.maxnum > 1024)
+				req.maxnum = 1024; //一次读512
+			rsp.num = fi->bt_memfinished.get_block_buf(rsp.tableBuf,req.maxnum,(uint32)req.startBufI);
+		}
+		else
+		{
+			rsp.result = 1;
+			rsp.num = 0;
+		}
+	}else
+	{
+		rsp.result = (uint32)-1;
+		rsp.num = 0;
+	}
+	return SendPTLPacket(PTL_P2P_RESPONSE_FILE_BLOCK_TABLE,rsp,peer,sizeof(rsp) +100);
+}
+int ShareService::ON_PTL_RequestFileBlocks(Peer* peer,PTLStream& ss)
+{
+	//DEBUGMSG("ON_PTL_RequestFileBlocks() \n");
+	PTL_P2P_RequestFileBlocks req;
+	if(0!=(ss >> req))
+	{
+		assert(0);
+		return -1;
+	}
+	GET_SHARE_PEERDATA_RETURN(data,peer,-1)
+
+	PTL_P2P_ResponseFileBlocks rsp;
+	memcpy(rsp.fhash,req.fhash,HASHLEN);
+	rsp.num = req.num;
+	bool isReady = true;
+	bool isFree = data->blockList.empty();
+	_hash.set_buffer((uchar*)req.fhash);
+	FileInfo* fi =  FileStorageSngl::instance()->get_readyinfo(_hash);
+	if (fi == NULL)
+	{
+		fi = FileStorageSngl::instance()->get_downinfo(_hash);
+		isReady = false;
+	}
+
+	BlockInfo bi;
+	unsigned int index=0;
+	bi.hash.set_buffer((uchar*)req.fhash);
+	rsp.blockSize = req.blockSize;
+	for (uint32 i=0; i<rsp.num; i++)
+	{
+		index =  (uint32)req.indexs[i];
+		rsp.indexs[i] = index;
+		if (fi && fi->block_size==req.blockSize && (isReady || 
+			(!isReady && fi->bt_memfinished.is_range(index) && fi->bt_memfinished[index]) ) )
+		{
+			rsp.blockState[i] = 1;
+			bi.index = index;
+			bi.pos = req.offsets[i];
+			bi.blockSize = fi->get_block_size(index);
+			bi.fileBlockSize = fi->block_size;
+			if(bi.pos<bi.blockSize)
+				data->blockList.push_back(bi);//不考虑有同一块的重复请求问题
+			else
+			{
+				assert(0);
+				rsp.blockState[i] = 0;
+			}
+		}
+		else
+		{
+			rsp.blockState[i] = 0;
+		}
+	}
+	if(0==SendPTLPacket(PTL_P2P_RESPONSE_FILE_BLOCKS,rsp,peer,1024))
+	{
+		//如果原因已经有任务则不执行发数据
+		if(isFree)
+			on_writable(peer);
+	}
+	return 0;
+}
+int ShareService::ON_PTL_CancelFileBlocks(Peer* peer,PTLStream& ss)
+{
+	PTL_P2P_CancelFileBlocks req;
+	if(0!=(ss >> req))
+	{
+		assert(0);
+		return -1;
+	}
+	GET_SHARE_PEERDATA_RETURN(data,peer,-1)
+	for(uint32 i=0;i<req.num;++i)
+	{
+		for(list<BlockInfo>::iterator it=data->blockList.begin();it!=data->blockList.end();)
+		{
+			if(0==(*it).hash.compare((uchar*)req.fhash) && (uint32)(*it).index == req.indexs[i])
+			{
+				data->blockList.erase(it++);
+				DEBUGMSG("#:shareservice cancel block(%d)\n",req.indexs[i]);
+				break;//不考虑有同一块的重复请求问题
+			}
+			else
+				++it;
+		}
+		if(data->fb && data->iCurrIndex == (uint32)req.indexs[i] && 0==data->hash.compare((uchar*)req.fhash))
+		{
+			FileStorageSngl::instance()->put_fileblock(data->fb);
+			data->fb = NULL;
+			data->iCurrIndex = 0;
+		}
+	}
+
+	return 0;
+}
+int ShareService::ON_PTL_RequestFileSubKeys(Peer* peer,PTLStream& ss)
+{
+	//暂时不支持
+	assert(0);
+	PTL_P2P_RequestFileSubKeys req;
+	if(0!=ss>>req)
+	{
+		assert(0);
+		return -1;
+	}
+	PTL_P2P_ResponseFileSubKeys rsp;
+	rsp.blockSize = req.blockSize;
+	memcpy(rsp.fhash,req.fhash,HASHLEN);
+	rsp.num = 0;
+	rsp.result = (uint32)-1;
+	return SendPTLPacket(PTL_P2P_RESPONSE_FILE_SUB_KEYS,rsp,peer,1024);
+}
+
+template<typename T>
+int ShareService::SendPTLPacket(uint16 cmd,T& inf,Peer* peer,int iMaxSize)
+{
+	NEW_MBLOCK_RETURN_INT(block,iMaxSize,-1)
+	PTLStream ss(block->buf,block->buflen,0);
+	m_head.cmd = cmd;
+	ss << m_head;
+	ss << inf;
+	ss.fitsize32(4);
+	block->datalen = ss.length();
+	return peer->send(block);
+}
+

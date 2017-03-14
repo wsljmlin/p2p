@@ -1,0 +1,51 @@
+#!/bin/sh
+
+ANDROID_NDK_PATH=~/Work/P2P/android-ndk-r9c
+P2P_MAIN_PATH=/home/wangsl/Work/P2P/SVN/P2P/src
+VKK_P2P_PATH=$P2P_MAIN_PATH/vkkp2p/vkkp2p
+VKK_COMM_PATH=$P2P_MAIN_PATH/vkkp2p/comm
+P2P_OUT=/home/wangsl/Work/P2P/SVN/P2P/src/p2pout
+
+TRACKER_BUILD_PATH=$VKK_P2P_PATH/linux/tracker
+TCCSVR_BUILD_PATH=$VKK_P2P_PATH/linux/tccsvr
+UAC_STUN_BUILD_PATH=$VKK_COMM_PATH/linux/uacstun
+ANDROID_VODPEER_BUILD_PATH=$VKK_P2P_PATH/android/vodpeer
+ANDROID_VODPEER_UPDATER_BUILD_PATH=$VKK_COMM_PATH/android/update
+
+TRACKER_SOURCE_PATH=$VKK_P2P_PATH/src/tracker
+TCCSVR_SOURCE_PATH=$VKK_P2P_PATH/src/tccsvr
+UAC_STUN_SOURCE_PATH=$VKK_COMM_PATH/src/uacstun
+ANDROID_VODPEER_SOURCE_PATH=$VKK_P2P_PATH/android/vodpeer
+ANDROID_VODPEER_UPDATER_SOURCE_PATH=$VKK_COMM_PATH/android/update
+
+trackerbin=$P2P_OUT/trackerbin
+stunbin=$P2P_OUT/stunbin
+tccbin=$P2P_OUT/stunbin
+vodpeerbin=$P2P_OUT/vodpeerbin
+
+[ ! -d $P2P_OUT/trackerbin ] &&  mkdir -p $P2P_OUT/trackerbin
+[ ! -d $P2P_OUT/stunbin ] && mkdir -p $P2P_OUT/stunbin
+[ ! -d  $P2P_OUT/vodpeerbin ] &&  mkdir -p $P2P_OUT/vodpeerbin
+
+alias makets='cd $TRACKER_BUILD_PATH && make clean && make  && cp -rf bin/* $P2P_OUT/trackerbin && cd -'
+alias maketcc='cd $TCCSVR_BUILD_PATH && make clean && make  && cp -rf bin/* $P2P_OUT/stunbin && cd -'
+alias makestun='cd $UAC_STUN_BUILD_PATH && make clean && make && cp -rf bin/* $P2P_OUT/stunbin && cd -'
+alias makevodpeer='cd $ANDROID_VODPEER_BUILD_PATH && $ANDROID_NDK_PATH/ndk-build &&cp -rf $ANDROID_VODPEER_BUILD_PATH/libs/armeabi/* $P2P_OUT/vodpeerbin && cd -'
+alias makevodupdater='cd $ANDROID_VODPEER_UPDATER_BUILD_PATH && $ANDROID_NDK_PATH/ndk-build &&cp -rf $ANDROID_VODPEER_UPDATER_BUILD_PATH/libs/armeabi/* $P2P_OUT/vodpeerbin && cd -'
+alias gts='cd $TRACKER_SOURCE_PATH'
+alias gtcc='cd $TCCSVR_SOURCE_PATH'
+alias gstun='cd $UAC_STUN_SOURCE_PATH'
+alias gvodpeer='cd $ANDROID_VODPEER_SOURCE_PATH'
+alias gtop='cd $P2P_MAIN_PATH'
+alias gtsbin='cd $TRACKER_BUILD_PATH/bin'
+alias gtccbin='cd $TCCSVR_BUILD_PATH/bin'
+alias gstunbin='cd $UAC_STUN_BUILD_PATH/bin'
+alias gvodpeerbin='cd $ANDROID_VODPEER_BUILD_PATH/libs/armeabi'
+alias gvodupdater='cd $ANDROID_VODPEER_UPDATER_BUILD_PATH/libs/armeabi'
+alias gout='cd $P2P_OUT'
+alias maketsclean='cd $TRACKER_BUILD_PATH && make clean && cp -rf bin/* $P2P_OUT/trackerbin && cd -'
+alias maketccclean='cd $TCCSVR_BUILD_PATH && make clean && cp -rf bin/* $P2P_OUT/stunbin && cd -'
+alias makestunclean='cd $UAC_STUN_BUILD_PATH && make clean  && cp -rf bin/* $P2P_OUT/stunbin && cd -'
+alias makeall='makets && maketcc && makestun && makevodpeer'
+alias makecleanall='maketsclean && maketccclean && makestunclean'
+alias makeupgrade='cd $P2P_MAIN_PATH/tools/upgrade/ && source ./generateUpgrade.sh'
